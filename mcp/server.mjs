@@ -15,12 +15,14 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const VERSION = '0.1.0'
+const VERSION = '0.1.1'
 const ENDPOINT_FILE =
   process.env.DSH_CLAUDE_CALL_ENDPOINT ??
   join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'claude-call', 'endpoint.json')
 const DEFAULT_WAIT_SECONDS = 40
-const MAX_WAIT_SECONDS = 300
+// Keep one synchronous wait under the ~300 s default HTTP header timeout used
+// by Node/undici clients (fetch aborts before a longer response head arrives).
+const MAX_WAIT_SECONDS = 240
 const HTTP_SLACK_MS = 20_000
 
 const INSTRUCTIONS = `These tools drive DSH (DeepSeek Harness), a separate coding agent running on this machine.
@@ -90,7 +92,7 @@ const TOOLS = [
   {
     name: 'dsh_wait',
     description:
-      'Block until the next DSH turn in a session finishes, then return its latest answer. Use the sinceSeq returned by dsh_task or dsh_status. Returns status "running" if the budget expires first, so you can call it again.',
+      'Block until the next DSH turn in a session finishes, then return its latest answer. Requires the sinceSeq returned by dsh_task or dsh_status: only a turn that ends after that sequence counts, so an old turn is never reported as the answer. Returns status "running" if the budget expires first, so you can call it again.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -104,7 +106,7 @@ const TOOLS = [
           description: `Wait budget in seconds (1-${MAX_WAIT_SECONDS}). Defaults to 45.`,
         },
       },
-      required: ['sessionId'],
+      required: ['sessionId', 'sinceSeq'],
       additionalProperties: false,
     },
   },
@@ -165,11 +167,15 @@ const HANDLERS = {
   },
 
   async dsh_wait(args) {
+    const sinceSeq = Number(args.sinceSeq)
+    if (!Number.isFinite(sinceSeq)) {
+      throw new Error('sinceSeq is required: pass the sinceSeq returned by dsh_task or dsh_status')
+    }
     const timeoutSeconds = clampSeconds(args.timeoutSeconds, 45)
     const body = {
       sessionId: args.sessionId,
+      sinceSeq,
       timeoutSeconds,
-      ...(Number.isFinite(args.sinceSeq) ? { sinceSeq: Number(args.sinceSeq) } : {}),
     }
     const outcome = await call('/wait', { method: 'POST', body, timeoutMs: timeoutSeconds * 1000 + HTTP_SLACK_MS })
     return formatOutcome(outcome)
@@ -203,14 +209,32 @@ async function call(path, { method = 'GET', body, query, timeoutMs = 60_000 }) {
     if (value !== undefined) url.searchParams.set(key, String(value))
   }
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(new Error(`DSH bridge did not answer within ${timeoutMs} ms`)), timeoutMs)
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
   try {
-    const response = await fetch(url, {
-      method,
-      headers: { 'content-type': 'application/json', 'x-claude-call-token': endpoint.token },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-    })
+    let response
+    try {
+      response = await fetch(url, {
+        method,
+        headers: { 'content-type': 'application/json', 'x-claude-call-token': endpoint.token },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (timedOut) {
+        throw new Error(
+          `DSH bridge did not answer within ${timeoutMs} ms. The turn is probably still running: ` +
+            'call dsh_status to read the session, then dsh_wait with a fresh sinceSeq.',
+        )
+      }
+      throw new Error(
+        `Cannot reach the DSH bridge at ${endpoint.origin} (${error?.message ?? error}). ` +
+          'Is DSH running with the dsh-claude-call plugin enabled?',
+      )
+    }
     const text = await response.text()
     let payload
     try {

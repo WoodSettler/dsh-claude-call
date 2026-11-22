@@ -19,8 +19,8 @@
  *   port                 bind port, 0 = ephemeral (default 0)
  *   defaultCwd           directory used when a request names none
  *   agentPreset          default Agent preset for spawned sessions
- *   waitTimeoutSeconds   default wait budget (default 600)
- *   maxWaitSeconds       hard cap for one wait (default 1800)
+ *   waitTimeoutSeconds   default wait budget (default 120)
+ *   maxWaitSeconds       hard cap for one wait (default 240)
  *   token                fixed token instead of a random per-process one
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -30,7 +30,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.1.0'
+const VERSION = '0.1.1'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
@@ -186,24 +186,29 @@ export function apply(ctx, config) {
     const preset = optionalText(body?.agentPreset) ?? options.agentPreset
     const title = optionalText(body?.title) ?? titleFor(prompt)
     const sessionId = await createSession({ cwd, preset, title })
-    const sinceSeq = currentSeq(sessionId)
+    const scanFrom = currentSeq(sessionId)
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
-    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false })
+    // The prompt may start a turn before this line; sinceSeq must cover it.
+    const sinceSeq = Math.max(scanFrom, currentSeq(sessionId) - 1)
+    return finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait: body?.wait !== false })
   }
 
   async function send(body) {
     const sessionId = requireId(body?.sessionId)
     const prompt = requireText(body?.prompt, 'prompt')
-    await ensureKnown(sessionId)
-    const sinceSeq = currentSeq(sessionId)
+    const known = await describeSession(sessionId)
+    // A cold session resumes inside prompt(), so the pre-admission cursor is
+    // the persisted log length, not -1.
+    const scanFrom = known.nextSeq
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
+    const sinceSeq = Math.max(scanFrom, currentSeq(sessionId) - 1)
     const title = optionalText(body?.title) ?? ''
-    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false })
+    return finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait: body?.wait !== false })
   }
 
-  async function finish({ sessionId, title, sinceSeq, requestId, body, wait }) {
+  async function finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait }) {
     const base = {
       ok: true,
       sessionId,
@@ -214,17 +219,20 @@ export function apply(ctx, config) {
     }
     if (!wait) return { ...base, status: 'dispatched', text: '', turnEndReason: null }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
-    const outcome = await waitForTurn(sessionId, { requestId, afterSeq: sinceSeq }, limitMs)
+    const outcome = await waitForTurn(sessionId, { requestId, afterSeq: scanFrom }, limitMs)
     return { ...base, ...outcome }
   }
 
   async function wait(body) {
     const sessionId = requireId(body?.sessionId)
-    await ensureKnown(sessionId)
-    const sinceSeq = Number.isFinite(body?.sinceSeq) ? Number(body.sinceSeq) : -1
+    await describeSession(sessionId)
+    const rawSinceSeq = body?.sinceSeq
+    if (typeof rawSinceSeq !== 'number' || !Number.isFinite(rawSinceSeq)) {
+      throw new HttpError(400, 'sinceSeq is required: pass the sinceSeq returned by dsh_task or dsh_status')
+    }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
-    const outcome = await waitForTurn(sessionId, { requestId: '', afterSeq: sinceSeq }, limitMs)
-    return { ok: true, sessionId, sinceSeq, ...outcome }
+    const outcome = await waitForTurn(sessionId, { requestId: '', afterSeq: rawSinceSeq }, limitMs)
+    return { ok: true, sessionId, sinceSeq: rawSinceSeq, ...outcome }
   }
 
   function cancel(body) {
@@ -238,26 +246,29 @@ export function apply(ctx, config) {
     const live = ctx.sessions.get(sessionId)
     if (live !== undefined) {
       const agent = ctx.agents.get(sessionId)
+      const head = Number(live.seq)
       return {
         ok: true,
         sessionId,
         live: true,
         running: agent?.status === 'running',
-        seq: Number(live.seq),
-        sinceSeq: Number(live.seq),
+        seq: head,
+        // Last observed event index: a turn/end appended next (seq === head)
+        // still satisfies "ends after sinceSeq".
+        sinceSeq: head - 1,
         ...tailOfSession(live),
       }
     }
     try {
       const inspected = await ctx.sessionController.inspect(sessionId)
-      const lastSeq = inspected.events.at(-1)?.seq
+      const lastSeq = inspected.events.at(-1)?.seq ?? -1
       return {
         ok: true,
         sessionId,
         live: false,
         running: false,
-        seq: lastSeq ?? 0,
-        sinceSeq: lastSeq ?? 0,
+        seq: lastSeq + 1,
+        sinceSeq: lastSeq,
         ...tailOfEvents(inspected.events),
       }
     } catch (error) {
@@ -267,10 +278,18 @@ export function apply(ctx, config) {
 
   // ------------------------------------------------------------ session work
 
-  async function ensureKnown(sessionId) {
-    if (ctx.sessions.get(sessionId) !== undefined) return
+  /**
+   * Resolve one session without activating it. `nextSeq` is the seq the next
+   * appended event will carry, which is the correct scan cursor for a prompt
+   * that is about to resume this session.
+   */
+  async function describeSession(sessionId) {
+    const live = ctx.sessions.get(sessionId)
+    if (live !== undefined) return { live: true, nextSeq: Number(live.seq) }
     try {
-      await ctx.sessionController.inspect(sessionId)
+      const inspected = await ctx.sessionController.inspect(sessionId)
+      const lastSeq = inspected.events.at(-1)?.seq
+      return { live: false, nextSeq: (lastSeq ?? -1) + 1 }
     } catch (error) {
       throw new HttpError(404, `session not found: ${sessionId} (${describe(error)})`)
     }
@@ -351,6 +370,10 @@ export function apply(ctx, config) {
           state.messageSeq = seq
         }
       } else if (event.type === 'assistant/message') {
+        // Only text produced after our prompt (or after the caller's cursor)
+        // counts: a resumed session replays its whole history through scan().
+        const lower = state.requestId !== '' ? state.messageSeq : state.afterSeq
+        if (lower < 0 || seq <= lower) continue
         const text = textOfMessage(event.data?.message)
         if (text !== '') state.text = text
       } else if (event.type === 'turn/end') {
@@ -460,8 +483,10 @@ function normalizeOptions(config) {
     port: clampNumber(source.port, 0, 0, 65535),
     defaultCwd: optionalText(source.defaultCwd) ?? '',
     agentPreset: optionalText(source.agentPreset) ?? '',
-    waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 600, 1, 3600),
-    maxWaitSeconds: clampNumber(source.maxWaitSeconds, 1800, 1, 3600),
+    // One synchronous wait stays under the ~300 s response-header timeout that
+    // Node/undici clients apply; longer work uses wait:false + polling.
+    waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 120, 1, 3600),
+    maxWaitSeconds: clampNumber(source.maxWaitSeconds, 240, 1, 3600),
     token: optionalText(source.token) ?? '',
   }
 }

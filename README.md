@@ -63,12 +63,13 @@ claude mcp remove -s user dsh-call
 |---|---|---|
 | `dsh_task` | 新建 DSH 会话并派任务；默认等一会儿拿答复 | `prompt`（必填）、`cwd`、`title`、`agentPreset`、`wait`（默认 true）、`timeoutSeconds`（默认 40） |
 | `dsh_send` | 往已有会话追加上下文 | `sessionId`、`prompt`、`wait`、`timeoutSeconds` |
-| `dsh_wait` | 等下一轮结束，返回最新答复 | `sessionId`、`sinceSeq`、`timeoutSeconds`（默认 45） |
+| `dsh_wait` | 等下一轮结束，返回最新答复 | `sessionId`、`sinceSeq`（必填）、`timeoutSeconds`（默认 45） |
 | `dsh_status` | 不等待，读运行状态 + 最近答复 | `sessionId` |
 | `dsh_cancel` | 取消当前轮（保留队列） | `sessionId` |
 
 等待超时不会失败，而是返回 `status: "running"` 和 `sinceSeq`，让调用方用 `dsh_wait` 续等——
-这样不会被 Claude Code 的 MCP 工具超时截断。
+这样不会被 Claude Code 的 MCP 工具超时截断。`sinceSeq` 只统计**在该序号之后结束**的轮次，
+所以历史里的旧答复不会被当成新一轮的结果；「下一轮还没开始就结束」的边界也已处理。
 
 ### 在 Claude Code 里可以这样说
 
@@ -87,8 +88,8 @@ claude mcp remove -s user dsh-call
 | `port` | `0` | 0 = 内核分配；固定端口便于排查 |
 | `defaultCwd` | 会话默认目录 | 请求不带 `cwd` 时用 |
 | `agentPreset` | 部署默认 preset | 新建会话的 Agent preset |
-| `waitTimeoutSeconds` | `600` | 单次 `wait` 默认预算 |
-| `maxWaitSeconds` | `1800` | 单次 `wait` 硬上限 |
+| `waitTimeoutSeconds` | `120` | 单次同步 `wait` 默认预算 |
+| `maxWaitSeconds` | `240` | 单次同步 `wait` 硬上限（见下方说明） |
 | `token` | 随机 | 想固定 token（例如写自己的脚本）时用 |
 
 ## HTTP 接口（给自己的脚本用）
@@ -100,7 +101,7 @@ claude mcp remove -s user dsh-call
 | `GET /health` | — | `{ok, version, pid, origin, sessions, running}` |
 | `POST /task` | `{prompt, cwd?, title?, agentPreset?, wait?, timeoutSeconds?}` | `{ok, sessionId, title, status, text, turnEndReason, sinceSeq, requestId}` |
 | `POST /send` | `{sessionId, prompt, wait?, timeoutSeconds?}` | 同上 |
-| `POST /wait` | `{sessionId, sinceSeq?, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason}` |
+| `POST /wait` | `{sessionId, sinceSeq, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason}` |
 | `GET /status?sessionId=` | — | `{running, live, lastAssistantText, lastTurnEndReason, sinceSeq}` |
 | `POST /cancel` | `{sessionId}` | `{cancelled: true}` |
 
@@ -112,16 +113,20 @@ node test/bridge.test.mjs
 ```
 
 测试用一个 stub Cordis 上下文直接挂载插件，覆盖：token 认证、建会话 + 等待 + 取答复、`wait:false`、
-`wait`/`status` 一致性、续聊、未知会话/路由、卸载时删除发现文件。**不依赖运行中的 DSH**。
+`wait`/`status` 一致性、续聊、冷会话（重启后 `send`）、`sinceSeq` 边界、未知会话/路由、卸载时删除发现文件。
+**不依赖运行中的 DSH**。
 
 ## 已知限制
 
 1. **改插件代码后需要重启 DSH**：DSH 的 Loader/Node 模块缓存不会在 profile 重组时丢弃已加载的
    ESM 模块，所以 `index.js` 的改动只有重启后生效（这是 DSH 的现有行为，不是本插件特有）。
-2. **不代改权限策略**：新会话沿用 DSH 当前的沙箱与审批策略；遇到需要人工 approval 的工具调用，
+2. **单次同步等待不超过 240 秒**：Node/undici 的 `fetch` 默认在约 300 秒内收不到响应头就会中止，
+   桥把默认等待压到 120 秒、硬上限 240 秒；更长的工作请用 `wait:false` 派发，再用 `dsh_status` /
+   `dsh_wait` 轮询。用 curl 之类没有该限制的客户端时，可在配置里把 `maxWaitSeconds` 调大。
+3. **不代改权限策略**：新会话沿用 DSH 当前的沙箱与审批策略；遇到需要人工 approval 的工具调用，
    会话会等你在 DSH UI 里点确认。桥不会自动提权、不会把 policy 改成 `never`。
-3. **没有流式输出**：只返回轮次结束后的最终文本；过程中的工具调用细节去 DSH 会话里看。
-4. **单机、单用户**：token 放在本机文件里，同机其他进程理论上可读；这是单人本机场景的取舍。
+4. **没有流式输出**：只返回轮次结束后的最终文本；过程中的工具调用细节去 DSH 会话里看。
+5. **单机、单用户**：token 放在本机文件里，同机其他进程理论上可读；这是单人本机场景的取舍。
 
 ## 故障排查
 
