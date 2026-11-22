@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Claude Code Bridge",
+    "description": "Lets Claude Code wake a DSH session, dispatch a task, and read the answer back over a loopback HTTP bridge."
+  }
+}

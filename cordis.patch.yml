@@ -1,0 +1,4 @@
+# dsh-claude-call: local HTTP bridge that lets Claude Code wake a DSH session.
+- insert:
+    - id: claude-call
+      name: dsh-claude-call

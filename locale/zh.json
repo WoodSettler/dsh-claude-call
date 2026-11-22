@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Claude Code 呼叫通道",
+    "description": "让 Claude Code 通过本机回环 HTTP 桥唤起 DSH 会话、派发任务并取回答复。"
+  }
+}
