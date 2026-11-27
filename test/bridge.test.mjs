@@ -134,11 +134,16 @@ function createHarness(overrides = {}) {
         content: [{ type: 'text', text }],
         source: { kind: 'user', rpcId: request.requestId },
       })
+      const turn = session.events.filter((event) => event.type === 'turn/start').length + 1
+      session.append('turn/start', { turn })
       const timer = setTimeout(() => {
         session.append('assistant/message', {
+          turn,
+          step: 1,
           message: { role: 'assistant', content: [{ type: 'text', text: 'pong' }] },
+          stream: [],
         })
-        session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+        session.append('turn/end', { turn, reason: { kind: 'completed' } })
       }, 120)
       timers.add(timer)
       return { accepted: true }
@@ -511,9 +516,11 @@ test('send resumes a cold session without rescanning its old log', async (t) => 
   assert.equal(sent.status, 200, JSON.stringify(sent.body))
   assert.equal(sent.body.status, 'done')
   assert.equal(sent.body.text, 'pong')
-  // 起点是旧日志长度（下一个事件的序号），不再是冷会话的 currentSeq() = -1。
-  assert.equal(sent.body.sinceSeq, history.length)
-  assert.equal(harness.store.get('session-cold').events.length, history.length + 3)
+  // 起点是旧日志长度（下一个事件的序号），不再是冷会话的 currentSeq() = -1：
+  // 上报的 sinceSeq 只会落在旧日志之后，不会回落到 0 让调用方重扫整份历史。
+  assert.ok(sent.body.sinceSeq >= history.length, `sinceSeq=${sent.body.sinceSeq}`)
+  // 旧日志 + prompt/user + turn/start + assistant + turn/end
+  assert.equal(harness.store.get('session-cold').events.length, history.length + 4)
 })
 
 test('a resumed cold session never reports the old answer as the new one', async (t) => {
@@ -574,5 +581,115 @@ test('wait refuses a missing sinceSeq', async (t) => {
   })
   assert.equal(refused.status, 400)
   assert.match(refused.body.error, /sinceSeq is required/)
+})
+
+test('task and send report how long the dispatch took', async (t) => {
+  const { call } = await mount(t, {})
+  const task = await call('/task', { method: 'POST', body: { prompt: '第一轮', timeoutSeconds: 5 } })
+  assert.equal(task.body.status, 'done')
+  // 桥侧墙钟：至少盖住 stub 里 120ms 的"模型思考"。
+  assert.ok(task.body.durationMs >= 100, JSON.stringify(task.body))
+  // 轮耗时来自 turn/start 与 turn/end 的事件时间差。
+  assert.ok(task.body.turnDurationMs >= 100, JSON.stringify(task.body))
+
+  const sent = await call('/send', {
+    method: 'POST',
+    body: { sessionId: task.body.sessionId, prompt: '第二轮', timeoutSeconds: 5 },
+  })
+  assert.equal(sent.body.status, 'done')
+  assert.ok(sent.body.durationMs >= 100)
+})
+
+test('turns list every finished turn newest first', async (t) => {
+  const { call } = await mount(t, {})
+  const first = await call('/task', { method: 'POST', body: { prompt: '第一轮：先说 pong', timeoutSeconds: 5 } })
+  const second = await call('/send', {
+    method: 'POST',
+    body: { sessionId: first.body.sessionId, prompt: '第二轮：再说一次', timeoutSeconds: 5 },
+  })
+  assert.equal(second.body.status, 'done')
+
+  const turns = await call(`/turns?sessionId=${first.body.sessionId}`)
+  assert.equal(turns.status, 200, JSON.stringify(turns.body))
+  assert.equal(turns.body.count, 2)
+  assert.equal(turns.body.items.length, 2)
+  // 最新的一轮排在最前面。
+  assert.equal(turns.body.items[0].turn, 2)
+  assert.equal(turns.body.items[0].reason, 'completed')
+  assert.equal(turns.body.items[0].prompt, '第二轮：再说一次')
+  assert.equal(turns.body.items[1].turn, 1)
+  for (const item of turns.body.items) {
+    assert.equal(item.open, false)
+    assert.ok(item.durationMs >= 100, JSON.stringify(item))
+    assert.ok(item.endedAt > item.startedAt)
+  }
+  assert.ok(turns.body.totalDurationMs >= 200)
+  assert.equal(turns.body.averageDurationMs, Math.round(turns.body.totalDurationMs / 2))
+  assert.equal(turns.body.pending, undefined)
+})
+
+test('turns report a running turn as pending, not as an average', async (t) => {
+  const { call } = await mount(t, {
+    // 只开始这一轮、永不结束：模拟派发后还在跑。
+    prompt(request, session) {
+      session.append('user/message', {
+        role: 'user',
+        content: [{ type: 'text', text: request.content[0].text }],
+        source: { kind: 'user', rpcId: request.requestId },
+      })
+      session.append('turn/start', { turn: 1 })
+      return { accepted: true }
+    },
+  })
+  const created = await call('/task', { method: 'POST', body: { prompt: '长活', wait: false } })
+
+  const turns = await call(`/turns?sessionId=${created.body.sessionId}`)
+  assert.equal(turns.status, 200, JSON.stringify(turns.body))
+  assert.equal(turns.body.count, 1)
+  assert.equal(turns.body.items[0].open, true)
+  assert.equal(turns.body.items[0].durationMs, null)
+  assert.ok(typeof turns.body.items[0].elapsedMs === 'number')
+  assert.equal(turns.body.totalDurationMs, 0)
+  // 未闭合的轮次不算进平均耗时。
+  assert.equal(turns.body.averageDurationMs, null)
+  assert.equal(turns.body.pending.turn, 1)
+})
+
+test('turns read a cold session from its persisted log', async (t) => {
+  const base = Date.now() - 60_000
+  const cold = {
+    meta: { id: 'session-cold', createdAt: base, isSeeded: false, cwd: 'C:\\work\\demo' },
+    events: [
+      {
+        type: 'user/message',
+        seq: 0,
+        time: base,
+        data: { role: 'user', content: [{ type: 'text', text: '旧任务' }], source: { kind: 'user' } },
+      },
+      { type: 'turn/start', seq: 1, time: base + 1_000, data: { turn: 1 } },
+      {
+        type: 'assistant/message',
+        seq: 2,
+        time: base + 5_000,
+        data: { message: { role: 'assistant', content: [{ type: 'text', text: '旧答复' }] } },
+      },
+      { type: 'turn/end', seq: 3, time: base + 6_000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ],
+  }
+  const { call } = await mount(t, { cold })
+
+  const turns = await call('/turns?sessionId=session-cold')
+  assert.equal(turns.status, 200, JSON.stringify(turns.body))
+  assert.equal(turns.body.count, 1)
+  assert.equal(turns.body.items[0].durationMs, 5_000)
+  assert.equal(turns.body.items[0].prompt, '旧任务')
+  assert.equal(turns.body.averageDurationMs, 5_000)
+})
+
+test('turns report an unknown session', async (t) => {
+  const { call } = await mount(t, {})
+  const missing = await call('/turns?sessionId=session-nope')
+  assert.equal(missing.status, 404)
+  assert.match(missing.body.error, /session not found/)
 })
 

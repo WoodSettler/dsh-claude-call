@@ -5,9 +5,9 @@
 - **DSH 侧**：一个 Host 插件（`dsh-claude-call`），在 `127.0.0.1` 上开一个**独立**的回环 HTTP 服务，收到请求后调用
   `ctx.sessionController.create()` 建会话、`prompt()` 投递任务，再从 **会话日志**（唯一真相）里读出 `turn/end`
   和最后一条 `assistant/message` 作为答复。
-- **Claude Code 侧**：一个**零依赖**的 MCP stdio server（`mcp/server.mjs`），把桥包装成 8 个工具：
+- **Claude Code 侧**：一个**零依赖**的 MCP stdio server（`mcp/server.mjs`），把桥包装成 9 个工具：
   `dsh_task` / `dsh_send` / `dsh_wait` / `dsh_status` / `dsh_cancel` /
-  `dsh_sessions` / `dsh_workspaces` / `dsh_models`。
+  `dsh_sessions` / `dsh_workspaces` / `dsh_models` / `dsh_turns`。
 
 ```
 Claude Code ──(MCP stdio)──> mcp/server.mjs ──(loopback HTTP + token)──> dsh-claude-call 插件
@@ -34,7 +34,7 @@ DSH Desktop 的 Web 服务外面有一层 `desktopBrowserAccess` 网关：只有
   {
     "schema": 1,
     "name": "claude-call",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "origin": "http://127.0.0.1:<随机端口>",
     "route": "",
     "token": "<每次启动随机生成的 48 位十六进制>",
@@ -70,6 +70,7 @@ claude mcp remove -s user dsh-call
 | `dsh_sessions` | 列历史会话（默认 20 条，最新在前）：标题、cwd、workspace、模型与推理等级、运行/可续状态 | `sessionId`（只精读这一个）、`limit`、`workspace`（按 id / 标题 / cwd 过滤） |
 | `dsh_workspaces` | 列已注册的 workspace（id、标题、路径、会话数） | — |
 | `dsh_models` | 列可用模型（按 provider 分组）与各自支持的 `reasoningEffort`，并给出部署默认 | — |
+| `dsh_turns` | 逐轮列出一个会话的耗时（最新在前）：每轮时长、起止时刻、结束原因、步数、该轮的提示 | `sessionId`（必填）、`limit`（默认 20） |
 
 等待超时不会失败，而是返回 `status: "running"` 和 `sinceSeq`，让调用方用 `dsh_wait` 续等——
 这样不会被 Claude Code 的 MCP 工具超时截断。`sinceSeq` 只统计**在该序号之后结束**的轮次，
@@ -92,6 +93,19 @@ claude mcp remove -s user dsh-call
   默认时才需要）。**不传就完全不动**，沿用 DSH 默认。传了就调用 DSH 原生的
   `sessionController.selectModel()`，它会把这次选择顺带存成**部署默认模型**——这是 DSH 的原生行为，桥不还原、
   不加开关（见「已知限制」）。
+
+### 每轮耗时
+
+`dsh_turns` 回答"这一趟到底跑多久"。两套计时口径都在：
+
+- **轮耗时**（`durationMs`）：来自会话日志里 `turn/start` 与 `turn/end` 两条事件的 `time` 差，也就是模型真正
+  干活的时间，和 DSH UI 里看到的是同一段。还没结束的最后一轮按 `open: true` 返回，只给 `elapsedMs`，
+  **不计入平均耗时**。
+- **桥耗时**（`durationMs`，`dsh_task` / `dsh_send` / `dsh_wait` 的返回里）：从桥收到请求（建会话、选模型、
+  排队、等轮次）到本次调用返回的墙钟时间；同时还有 `turnDurationMs` 给出那一轮本身的长度。
+
+时间戳一律取自事件自身，所以桥什么时候被叫醒都不影响统计。冷会话（DSH 重启前建的）会先读一遍持久化日志，
+`dsh_turns` 因此给它更宽的 60 秒预算。
 
 ### 在 Claude Code 里可以这样说
 
@@ -128,9 +142,10 @@ claude mcp remove -s user dsh-call
 | `GET /sessions` | 查询串 `?limit=&workspace=&sessionId=` | `{ok, count, limit, items: [{sessionId, title, cwd, workspace, model, modelLastUsed?, modelSource, live, running, agentAvailable, blank, updatedAt, parentSessionId?, origin?, archived, resumable}]}` |
 | `GET /workspaces` | — | `{ok, defaultCwd, count, items: [{id, title, path, createdAt?, updatedAt?, sessions}]}` |
 | `GET /models` | — | `{ok, default, routableProviders, count, groups: [{id, name, models: [{id, name, description?, reasoningEfforts, defaultEffort?}]}], failures}` |
-| `POST /task` | `{prompt, cwd?, title?, agentPreset?, workspaceId?, workspacePath?, workspaceTitle?, createWorkspace?, provider?, model?, reasoningEffort?, wait?, timeoutSeconds?}` | `{ok, sessionId, title, status, text, turnEndReason, sinceSeq, requestId, model?, workspace?}` |
+| `GET /turns` | 查询串 `?sessionId=&limit=` | `{ok, sessionId, cwd, count, limit, totalDurationMs, averageDurationMs, pending?: {turn, elapsedMs, ...}, items: [{turn, startedAt, endedAt, durationMs, open, elapsedMs?, reason, steps, prompt}]}`（最新在前） |
+| `POST /task` | `{prompt, cwd?, title?, agentPreset?, workspaceId?, workspacePath?, workspaceTitle?, createWorkspace?, provider?, model?, reasoningEffort?, wait?, timeoutSeconds?}` | `{ok, sessionId, title, status, text, turnEndReason, turnDurationMs, durationMs, sinceSeq, requestId, model?, workspace?}` |
 | `POST /send` | `{sessionId, prompt, provider?, model?, reasoningEffort?, wait?, timeoutSeconds?}` | 同上（带 workspace 字段则 400 `workspace/immutable`） |
-| `POST /wait` | `{sessionId, sinceSeq, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason}` |
+| `POST /wait` | `{sessionId, sinceSeq, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason, turnDurationMs}` |
 | `GET /status?sessionId=` | — | `{...会话记录, running, live, lastAssistantText, lastTurnEndReason, seq, sinceSeq}` |
 | `POST /cancel` | `{sessionId}` | `{cancelled: true}` |
 
@@ -143,9 +158,10 @@ node test/bridge.test.mjs   # 或 node --test test/
 
 测试用一个 stub Cordis 上下文直接挂载插件，覆盖：token 认证、建会话 + 等待 + 取答复、`wait:false`、
 `wait`/`status` 一致性、`sinceSeq` 边界、续聊、冷会话（重启后 `send`）与其扫描起点、旧答复不被当成本轮结果、
-`sinceSeq` 缺失被拒、未知会话/路由、卸载时删除发现文件，以及本轮新增的会话发现（workspace / 模型 /
+`sinceSeq` 缺失被拒、未知会话/路由、卸载时删除发现文件，以及会话发现（workspace / 模型 /
 可续状态）、单会话精读、workspace 与模型目录、创建时指定 workspace 与模型、`dsh_send` 拒绝 workspace
-字段并换模型、归档与子代理会话的拦截。共 18 个测试，**不依赖运行中的 DSH**。
+字段并换模型、归档与子代理会话的拦截，还有每轮耗时（桥耗时与轮耗时、逐轮列表、未闭合轮次算 pending、
+冷会话从持久化日志读、未知会话 404）。共 23 个测试，**不依赖运行中的 DSH**。
 
 沙箱提示：DSH 的沙箱不允许 `node --test` 通过管道 spawn 子进程，直接跑 `node --test test/`
 会报 `Error: spawn EPERM`；用上面的**进程内**跑法 `node test/bridge.test.mjs` 即可。
@@ -171,6 +187,9 @@ node test/bridge.test.mjs   # 或 node --test test/
 8. **归档会话与子代理会话不能续聊**：归档会话的 prompt 会被接受，但 `agent/pre-step` 会直接拒绝它（表现为
    发得出去、永远推不动）；`origin === 'subagent'` 的会话不允许被 resume。桥现在提前拦截，分别返回
    `session/archived` 与 `session/not-resumable`，并在 `dsh_sessions` 里标出 `archived` 与 `resumable: false`。
+9. **每轮耗时的口径**：`dsh_turns` 的时长＝`turn/end.time - turn/start.time`。日志里缺 `turn/start`（例如从更早
+   的格式迁移来、或续聊时只看到半轮）时该轮 `durationMs` 为 `null`，桥不猜。fork 出来的会话会带父会话的
+   继承前缀，那些轮次也会一起列出。
 
 ## 故障排查
 
@@ -185,6 +204,7 @@ node test/bridge.test.mjs   # 或 node --test test/
 | HTTP 400 `session/not-resumable` | 该会话属于子代理，不能在桥里继续，请在 DSH UI 里操作 |
 | `dsh_sessions` 里 `model` 是 `null` | 该会话还没有 `request/header`（刚建、还没跑过），DSH 里也没有别的记录；用 `dsh_models` 看默认模型 |
 | `status: running` 一直不变 | 会话在等人审批，或任务本身很长；用 `dsh_status` 看，必要时 `dsh_cancel` |
+| `dsh_turns` 里 `durationMs` 是 `null` | 该轮日志缺 `turn/start`（迁移来的旧会话，或只看到半轮）；`open: true` 的那轮本来就没有结束时间，看 `elapsedMs` |
 | 改了代码没生效 | 重启 DSH Desktop |
 
 ## 卸载

@@ -1,8 +1,8 @@
 {
   "name": "dsh-claude-call",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
-  "description": "Local bridge that lets Claude Code list DSH sessions, wake one in a chosen workspace and model, dispatch a task, and read the answer back.",
+  "description": "Local bridge that lets Claude Code list DSH sessions, wake one in a chosen workspace and model, dispatch a task, read the answer back, and inspect how long each turn took.",
   "type": "module",
   "exports": {
     ".": "./index.js",

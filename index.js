@@ -24,10 +24,12 @@
  *   listLimit            default page size for GET /sessions (default 20)
  *   token                fixed token instead of a random per-process one
  *
- * Read-only discovery (GET /sessions, /workspaces, /models) answers from DSH
+ * Read-only discovery (GET /sessions, /workspaces, /models, /turns) answers from DSH
  * views and projections only, so a caller can find the session, workspace or
  * model it wants before it dispatches work. The projections supply the session
  * title and the model it is using, which the session header does not carry.
+ * GET /turns folds the event log into one row per turn, so a caller can see how
+ * long each dispatched turn took (the timestamps are the DSH event times).
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -36,7 +38,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.2.0'
+const VERSION = '0.2.1'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
@@ -169,6 +171,8 @@ export function apply(ctx, config) {
           return respond(res, 200, workspaces())
         case 'GET /models':
           return respond(res, 200, await models())
+        case 'GET /turns':
+          return respond(res, 200, await turns(url.searchParams))
         default:
           return respond(res, 404, { ok: false, error: `unknown route: ${key}` })
       }
@@ -195,6 +199,7 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------- operations
 
   async function task(body) {
+    const startedAt = Date.now()
     const prompt = requireText(body?.prompt, 'prompt')
     const target = await resolveWorkspaceTarget(body)
     const preset = optionalText(body?.agentPreset) ?? options.agentPreset
@@ -217,10 +222,12 @@ export function apply(ctx, config) {
       wait: body?.wait !== false,
       model,
       workspace: target.workspace,
+      startedAt,
     })
   }
 
   async function send(body) {
+    const startedAt = Date.now()
     const sessionId = requireId(body?.sessionId)
     const prompt = requireText(body?.prompt, 'prompt')
     rejectWorkspaceFields(body)
@@ -231,10 +238,10 @@ export function apply(ctx, config) {
     await admit(sessionId, prompt, requestId)
     const sinceSeq = Math.max(nextSeq, currentSeq(sessionId) - 1)
     const title = optionalText(body?.title) ?? ''
-    return finish({ sessionId, title, scanFrom: nextSeq, sinceSeq, requestId, body, wait: body?.wait !== false, model })
+    return finish({ sessionId, title, scanFrom: nextSeq, sinceSeq, requestId, body, wait: body?.wait !== false, model, startedAt })
   }
 
-  async function finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait, model, workspace }) {
+  async function finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait, model, workspace, startedAt }) {
     const base = {
       ok: true,
       sessionId,
@@ -245,10 +252,12 @@ export function apply(ctx, config) {
       ...(model === undefined || model === null ? {} : { model }),
       ...(workspace === undefined ? {} : { workspace: workspaceView(workspace) }),
     }
-    if (!wait) return { ...base, status: 'dispatched', text: '', turnEndReason: null }
+    // 桥侧墙钟耗时：从收到请求（建会话、选模型、等轮次）到此刻。
+    const elapsed = () => Date.now() - startedAt
+    if (!wait) return { ...base, status: 'dispatched', text: '', turnEndReason: null, durationMs: elapsed() }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
     const outcome = await waitForTurn(sessionId, { requestId, afterSeq: scanFrom }, limitMs)
-    return { ...base, ...outcome }
+    return { ...base, ...outcome, durationMs: elapsed() }
   }
 
   async function wait(body) {
@@ -368,6 +377,103 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * GET /turns：逐轮给出耗时。
+   * 时间戳一律取自事件自身的 time（DSH 落日志的毫秒数），所以同一轮在 DSH UI 里
+   * 与这里看到的是同一段时间，不受桥进程何时被叫醒影响。
+   */
+  async function turns(params) {
+    const sessionId = requireId(params.get('sessionId'))
+    const limit = clampNumber(params.get('limit'), options.listLimit, 1, MAX_LIST_LIMIT)
+    const header = await knownHeader(sessionId)
+    const records = foldTurns(await readTimeline(sessionId))
+    const closed = records.filter((record) => record.open !== true && typeof record.durationMs === 'number')
+    const totalDurationMs = closed.reduce((total, record) => total + record.durationMs, 0)
+    const pending = records.at(-1)?.open === true ? records.at(-1) : undefined
+    return {
+      ok: true,
+      origin,
+      sessionId,
+      cwd: header?.cwd ?? null,
+      count: records.length,
+      limit,
+      totalDurationMs,
+      averageDurationMs: closed.length === 0 ? null : Math.round(totalDurationMs / closed.length),
+      // 末尾未闭合的轮次正在跑，单列出来，别混进平均耗时。
+      ...(pending === undefined ? {} : { pending }),
+      items: records.slice(-limit).reverse(),
+    }
+  }
+
+  /** 取一份按 seq 升序的事件列表：live 会话读内存日志，冷会话读持久化前缀。 */
+  async function readTimeline(sessionId) {
+    const live = ctx.sessions.get(sessionId)
+    if (live !== undefined) {
+      const head = Number(live.seq)
+      const events = []
+      for (let seq = 0; seq < head; seq++) {
+        const event = live.eventAt(seq)
+        if (event !== undefined) events.push(event)
+      }
+      return events
+    }
+    const inspected = await inspectSession(sessionId)
+    return [...(inspected?.events ?? [])].sort((left, right) => Number(left?.seq ?? 0) - Number(right?.seq ?? 0))
+  }
+
+  /**
+   * 把事件折叠成"每轮一条"：turn/start 记开始时间，turn/end 记结束并算差。
+   * DSH 的 user/message 不带轮次号，所以每轮的提示取该轮开始前最后一条人工消息。
+   * 末尾没有 turn/end 的轮次按 open 返回，给 elapsedMs，不混进平均耗时。
+   */
+  function foldTurns(events) {
+    const records = []
+    let prompt = ''
+    let open
+    for (const event of events) {
+      if (event?.type === 'user/message') {
+        const source = event.data?.source ?? event.data?.message?.source
+        if (source?.kind === 'user') prompt = textOfMessage(event.data?.message ?? event.data)
+        continue
+      }
+      if (event?.type === 'turn/start') {
+        open = {
+          turn: Number(event.data?.turn ?? records.length + 1),
+          startedAt: typeof event.time === 'number' ? event.time : null,
+          prompt: prompt === '' ? null : previewText(prompt),
+          steps: 0,
+        }
+        continue
+      }
+      if (event?.type === 'step/start' && open !== undefined) {
+        open.steps += 1
+        continue
+      }
+      if (event?.type === 'turn/end' && open !== undefined) {
+        const endedAt = typeof event.time === 'number' ? event.time : null
+        records.push({
+          ...open,
+          endedAt,
+          durationMs: endedAt === null || open.startedAt === null ? null : endedAt - open.startedAt,
+          open: false,
+          reason: event.data?.reason?.kind ?? null,
+        })
+        open = undefined
+      }
+    }
+    if (open !== undefined) {
+      records.push({
+        ...open,
+        endedAt: null,
+        durationMs: null,
+        elapsedMs: open.startedAt === null ? null : Date.now() - open.startedAt,
+        open: true,
+        reason: null,
+      })
+    }
+    return records
+  }
+
   async function status(rawSessionId) {
     const sessionId = requireId(rawSessionId)
     const live = ctx.sessions.get(sessionId)
@@ -475,7 +581,7 @@ export function apply(ctx, config) {
    * to end. Reads the live Session log only; the durable log is truth.
    */
   async function waitForTurn(sessionId, { requestId, afterSeq }, limitMs) {
-    const state = { requestId, afterSeq, messageSeq: -1, endSeq: -1, reason: undefined, text: '' }
+    const state = { requestId, afterSeq, messageSeq: -1, endSeq: -1, reason: undefined, text: '', turnStartAt: -1, turnMs: null }
     const deadline = Date.now() + limitMs
     let cursor = afterSeq >= 0 ? afterSeq : 0
     for (;;) {
@@ -496,6 +602,7 @@ export function apply(ctx, config) {
       status: state.endSeq >= 0 ? 'done' : 'running',
       text: state.text,
       turnEndReason: state.reason?.kind ?? null,
+      turnDurationMs: state.turnMs,
     }
   }
 
@@ -515,6 +622,9 @@ export function apply(ctx, config) {
         if (lower < 0 || seq <= lower) continue
         const text = textOfMessage(event.data?.message)
         if (text !== '') state.text = text
+      } else if (event.type === 'turn/start') {
+        // 记下本轮开始时间，turn/end 到来时就能算出这一轮的模型耗时。
+        if (typeof event.time === 'number') state.turnStartAt = event.time
       } else if (event.type === 'turn/end') {
         if (state.endSeq >= 0) continue
         if (state.requestId !== '') {
@@ -524,6 +634,7 @@ export function apply(ctx, config) {
         }
         state.endSeq = seq
         state.reason = event.data?.reason
+        if (state.turnStartAt >= 0 && typeof event.time === 'number') state.turnMs = event.time - state.turnStartAt
       }
     }
   }
@@ -892,6 +1003,12 @@ function textOfMessage(message) {
     if (block?.type === 'text' && typeof block.text === 'string' && block.text !== '') parts.push(block.text)
   }
   return parts.join('\n').trim()
+}
+
+/** 把一段文本压成单行预览，避免 /turns 把整段 prompt 原样带出来。 */
+function previewText(text, limit = 100) {
+  const compact = String(text ?? '').replace(/\s+/g, ' ').trim()
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact
 }
 
 function describe(error) {

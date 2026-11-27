@@ -2,10 +2,11 @@
 /**
  * dsh-claude-call — MCP stdio server for Claude Code.
  *
- * It exposes eight tools that drive the DSH bridge plugin over loopback HTTP:
- * list sessions, workspaces and models, dispatch a task into a brand-new DSH
- * session (optionally into a chosen workspace and with a chosen model), continue
- * an existing session, wait for a turn, read its state, or cancel it.
+ * It exposes nine tools that drive the DSH bridge plugin over loopback HTTP:
+ * list sessions, workspaces and models, read the per-turn timings of a session,
+ * dispatch a task into a brand-new DSH session (optionally into a chosen
+ * workspace and with a chosen model), continue an existing session, wait for a
+ * turn, read its state, or cancel it.
  *
  * The server is dependency-free on purpose: Claude Code spawns it with plain
  * Node, and nothing has to be installed. Protocol messages are newline
@@ -16,7 +17,7 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const VERSION = '0.2.0'
+const VERSION = '0.2.1'
 const ENDPOINT_FILE =
   process.env.DSH_CLAUDE_CALL_ENDPOINT ??
   join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'claude-call', 'endpoint.json')
@@ -33,7 +34,8 @@ parallel with your own work, or should continue after this turn. The default cal
 DSH's final answer; if status is "running", call dsh_wait with the returned sessionId and sinceSeq to collect it later.
 Use dsh_sessions to find earlier DSH work and continue it with dsh_send, or to read which workspace and model a
 session uses. dsh_workspaces and dsh_models list the folders and models you can pass to dsh_task. A session keeps
-the workspace it was created in, so choose the workspace and model at dsh_task time; omit them to use DSH defaults.`
+the workspace it was created in, so choose the workspace and model at dsh_task time; omit them to use DSH defaults.
+Use dsh_turns to see how long each turn of a session took.`
 
 const TOOLS = [
   {
@@ -211,6 +213,23 @@ const TOOLS = [
       'List the models DSH can run, grouped by provider, with the reasoningEffort ids each model supports and the current deployment default. Use these ids with dsh_task or dsh_send.',
     inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
   },
+  {
+    name: 'dsh_turns',
+    description:
+      'List the turns of one DSH session with their elapsed time, newest first. The durations come from the DSH event log (turn start to turn end), so they show how long the model actually worked on each turn; the newest turn is reported as pending while it is still running. Use it to tell where a dispatched session spent its time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'The DSH session whose turns should be listed.' },
+        limit: {
+          type: 'integer',
+          description: `How many recent turns to return, newest first (1-${MAX_LIST_LIMIT}, default 20).`,
+        },
+      },
+      required: ['sessionId'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 const HANDLERS = {
@@ -295,6 +314,15 @@ const HANDLERS = {
   async dsh_models() {
     return formatModels(await call('/models', { method: 'GET', timeoutMs: 30_000 }))
   },
+
+  async dsh_turns(args) {
+    const query = {
+      sessionId: args.sessionId,
+      ...(Number.isFinite(args.limit) ? { limit: Math.round(Number(args.limit)) } : {}),
+    }
+    // 冷会话要把持久化日志读一遍，给更宽的预算。
+    return formatTurns(await call('/turns', { method: 'GET', query, timeoutMs: 60_000 }))
+  },
 }
 
 // --------------------------------------------------------------- transport
@@ -377,6 +405,8 @@ function formatOutcome(value) {
   if (value.workspace) lines.push(`workspace: ${formatWorkspace(value.workspace)}`)
   if (value.model) lines.push(`model: ${formatModel(value.model)}`)
   lines.push(`status: ${value.status}${value.turnEndReason ? ` (turn end: ${value.turnEndReason})` : ''}`)
+  if (typeof value.turnDurationMs === 'number') lines.push(`turn took: ${formatDuration(value.turnDurationMs)}`)
+  if (typeof value.durationMs === 'number') lines.push(`call took: ${formatDuration(value.durationMs)}`)
   if (value.status === 'running' || value.status === 'dispatched') {
     lines.push(
       `DSH is still working. Call dsh_wait with sessionId="${value.sessionId}" and sinceSeq=${value.sinceSeq ?? 0} to collect the answer.`,
@@ -455,6 +485,50 @@ function formatWorkspaces(value) {
   }
   if (typeof value?.defaultCwd === 'string') {
     lines.push('', `default directory for sessions created without cwd: ${value.defaultCwd}`)
+  }
+  return lines.join('\n')
+}
+
+/** 毫秒转人读时长：不足 1 秒给毫秒，不足 1 分钟给秒，再长给分秒。 */
+function formatDuration(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return 'unknown'
+  const value = Math.max(0, Math.round(ms))
+  if (value < 1000) return `${value}ms`
+  if (value < 60_000) return `${(value / 1000).toFixed(1)}s`
+  const minutes = Math.floor(value / 60_000)
+  const seconds = Math.round((value % 60_000) / 1000)
+  return `${minutes}m${String(seconds).padStart(2, '0')}s`
+}
+
+function clockOf(ms) {
+  return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toISOString().slice(11, 19) : '??:??:??'
+}
+
+function formatTurns(value) {
+  const items = Array.isArray(value?.items) ? value.items : []
+  const head = `DSH turns for ${value?.sessionId ?? 'session'}`
+  if (items.length === 0) return `${head}: no turn is recorded yet.`
+  const total = typeof value?.count === 'number' ? value.count : items.length
+  const lines = [`${head} (${items.length} of ${total} shown, newest first):`]
+  const summary = []
+  if (typeof value.averageDurationMs === 'number') summary.push(`average ${formatDuration(value.averageDurationMs)}`)
+  if (typeof value.totalDurationMs === 'number') summary.push(`total ${formatDuration(value.totalDurationMs)}`)
+  if (summary.length > 0) lines.push(summary.join(' over finished turns, '))
+  if (value.pending) {
+    lines.push(`now: turn ${value.pending.turn} still running (${formatDuration(value.pending.elapsedMs)} so far)`)
+  }
+  for (const item of items) {
+    const timing =
+      item.open === true
+        ? `running ${formatDuration(item.elapsedMs)}`
+        : `${formatDuration(item.durationMs)}${item.reason ? ` (${item.reason})` : ''}`
+    const window =
+      item.open === true
+        ? `started ${clockOf(item.startedAt)}`
+        : `${clockOf(item.startedAt)} to ${clockOf(item.endedAt)}`
+    const steps = item.steps > 0 ? ` · ${item.steps} step${item.steps === 1 ? '' : 's'}` : ''
+    lines.push('', `- turn ${item.turn}: ${timing} · ${window}${steps}`)
+    if (typeof item.prompt === 'string' && item.prompt !== '') lines.push(`  prompt: ${item.prompt}`)
   }
   return lines.join('\n')
 }
