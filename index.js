@@ -21,7 +21,13 @@
  *   agentPreset          default Agent preset for spawned sessions
  *   waitTimeoutSeconds   default wait budget (default 600)
  *   maxWaitSeconds       hard cap for one wait (default 1800)
+ *   listLimit            default page size for GET /sessions (default 20)
  *   token                fixed token instead of a random per-process one
+ *
+ * Read-only discovery (GET /sessions, /workspaces, /models) answers from DSH
+ * views and projections only, so a caller can find the session, workspace or
+ * model it wants before it dispatches work. The projections supply the session
+ * title and the model it is using, which the session header does not carry.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -30,11 +36,13 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
+const DEFAULT_LIST_LIMIT = 20
+const MAX_LIST_LIMIT = 200
 
 export const name = NAME
 /** Every capability this plugin touches; the plugin stays inactive without them. */
@@ -155,6 +163,12 @@ export function apply(ctx, config) {
           return respond(res, 200, cancel(await readJson(req)))
         case 'GET /status':
           return respond(res, 200, await status(url.searchParams.get('sessionId')))
+        case 'GET /sessions':
+          return respond(res, 200, await sessions(url.searchParams))
+        case 'GET /workspaces':
+          return respond(res, 200, workspaces())
+        case 'GET /models':
+          return respond(res, 200, await models())
         default:
           return respond(res, 404, { ok: false, error: `unknown route: ${key}` })
       }
@@ -182,28 +196,41 @@ export function apply(ctx, config) {
 
   async function task(body) {
     const prompt = requireText(body?.prompt, 'prompt')
-    const cwd = await resolveDirectory(body?.cwd)
+    const target = await resolveWorkspaceTarget(body)
     const preset = optionalText(body?.agentPreset) ?? options.agentPreset
     const title = optionalText(body?.title) ?? titleFor(prompt)
-    const sessionId = await createSession({ cwd, preset, title })
+    const sessionId = await createSession({ cwd: target.cwd, preset, title, workspace: target.workspace })
+    // 只有显式给了 model/provider/reasoningEffort 才切换；否则沿用 DSH 的部署默认。
+    const model = await applyModel(sessionId, body)
     const sinceSeq = currentSeq(sessionId)
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
-    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false })
+    return finish({
+      sessionId,
+      title,
+      sinceSeq,
+      requestId,
+      body,
+      wait: body?.wait !== false,
+      model,
+      workspace: target.workspace,
+    })
   }
 
   async function send(body) {
     const sessionId = requireId(body?.sessionId)
     const prompt = requireText(body?.prompt, 'prompt')
-    await ensureKnown(sessionId)
-    const sinceSeq = currentSeq(sessionId)
+    rejectWorkspaceFields(body)
+    const { header, sinceSeq } = await resumeTarget(sessionId)
+    assertResumable(sessionId, header)
+    const model = await applyModel(sessionId, body)
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
     const title = optionalText(body?.title) ?? ''
-    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false })
+    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false, model })
   }
 
-  async function finish({ sessionId, title, sinceSeq, requestId, body, wait }) {
+  async function finish({ sessionId, title, sinceSeq, requestId, body, wait, model, workspace }) {
     const base = {
       ok: true,
       sessionId,
@@ -211,6 +238,8 @@ export function apply(ctx, config) {
       sinceSeq,
       requestId,
       origin,
+      ...(model === undefined || model === null ? {} : { model }),
+      ...(workspace === undefined ? {} : { workspace: workspaceView(workspace) }),
     }
     if (!wait) return { ...base, status: 'dispatched', text: '', turnEndReason: null }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
@@ -220,7 +249,7 @@ export function apply(ctx, config) {
 
   async function wait(body) {
     const sessionId = requireId(body?.sessionId)
-    await ensureKnown(sessionId)
+    await knownHeader(sessionId)
     const sinceSeq = Number.isFinite(body?.sinceSeq) ? Number(body.sinceSeq) : -1
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
     const outcome = await waitForTurn(sessionId, { requestId: '', afterSeq: sinceSeq }, limitMs)
@@ -233,12 +262,114 @@ export function apply(ctx, config) {
     return { ok: true, sessionId, cancelled: true }
   }
 
+  // ------------------------------------------------------- read-only discovery
+
+  /**
+   * GET /sessions：列出会话。
+   * 默认只读一次 sessionController.list()（它已经带全量投影，零额外 I/O）；
+   * 只有点名 sessionId 时才做单会话精读，避免为每一行去翻冷会话日志。
+   */
+  async function sessions(params) {
+    const sessionId = optionalText(params.get('sessionId'))
+    if (sessionId !== undefined) {
+      const header = await knownHeader(sessionId)
+      return { ok: true, origin, items: [await sessionRow(sessionId, header)] }
+    }
+    const limit = clampNumber(params.get('limit'), options.listLimit, 1, MAX_LIST_LIMIT)
+    const filter = optionalText(params.get('workspace'))
+    const archived = archivedIds()
+    let rows
+    try {
+      rows = await ctx.sessionController.list({})
+    } catch (error) {
+      throw new HttpError(500, `DSH could not list sessions: ${describe(error)}`)
+    }
+    const items = []
+    for (const row of rows ?? []) {
+      if (row?.sessionId === undefined) continue
+      const record = sessionRecord({ sessionId: row.sessionId, hints: row.projections, row, archived })
+      // workspace 过滤同时接受 id、标题与 cwd，调用方按哪种口径收敛都能命中。
+      if (
+        filter !== undefined &&
+        record.workspace?.id !== filter &&
+        record.workspace?.title !== filter &&
+        record.cwd !== filter
+      ) {
+        continue
+      }
+      items.push(record)
+    }
+    items.sort((left, right) => String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? '')))
+    return { ok: true, origin, count: items.length, limit, items: items.slice(0, limit) }
+  }
+
+  /** GET /workspaces：列出已注册的 workspace（durable 顺序，与 DSH 界面一致）。 */
+  function workspaces() {
+    const registry = ctx.get('workspaceRegistry')
+    if (registry === undefined) throw new HttpError(503, 'this DSH deployment has no workspace registry')
+    let entries
+    try {
+      entries = registry.list()
+    } catch (error) {
+      throw new HttpError(500, `DSH could not list workspaces: ${describe(error)}`)
+    }
+    return {
+      ok: true,
+      origin,
+      defaultCwd: ctx.get('workingDirectory')?.defaultDirectory ?? null,
+      count: entries.length,
+      items: entries.map((workspace) => ({
+        id: String(workspace.id),
+        title: workspace.title ?? null,
+        path: workspace.path ?? null,
+        ...(workspace.createdAt === undefined ? {} : { createdAt: workspace.createdAt }),
+        ...(workspace.updatedAt === undefined ? {} : { updatedAt: workspace.updatedAt }),
+        // sessionIds 已由 DSH 按 canonical cwd 过滤，这里只是计数。
+        sessions: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.length : 0,
+      })),
+    }
+  }
+
+  /** GET /models：列出可选模型与各自支持的推理等级，并给出部署默认。 */
+  async function models() {
+    let catalog
+    try {
+      catalog = await ctx.sessionController.modelCatalog()
+    } catch (error) {
+      throw new HttpError(500, `DSH could not read the model catalog: ${describe(error)}`)
+    }
+    const groups = catalog?.groups ?? []
+    return {
+      ok: true,
+      origin,
+      default: modelView(catalog?.default) ?? null,
+      routableProviders: catalog?.routableProviders ?? [],
+      count: groups.reduce((total, group) => total + (group.models?.length ?? 0), 0),
+      groups: groups.map((group) => ({
+        id: group.id,
+        name: group.name ?? null,
+        models: (group.models ?? []).map((entry) => ({
+          id: entry.id,
+          name: entry.name ?? null,
+          ...(entry.description === undefined ? {} : { description: entry.description }),
+          reasoningEfforts: (entry.reasoning?.efforts ?? []).map((effort) => effort.id),
+          ...(entry.reasoning?.defaultEffort === undefined ? {} : { defaultEffort: entry.reasoning.defaultEffort }),
+        })),
+      })),
+      failures: catalog?.failures ?? [],
+    }
+  }
+
   async function status(rawSessionId) {
     const sessionId = requireId(rawSessionId)
     const live = ctx.sessions.get(sessionId)
+    const header = await knownHeader(sessionId)
+    // 会话头里没有 title/workspace/model，这三项只能来自投影与注册表。
+    const record = await sessionRow(sessionId, header)
     if (live !== undefined) {
       const agent = ctx.agents.get(sessionId)
       return {
+        ...record,
         ok: true,
         sessionId,
         live: true,
@@ -248,45 +379,62 @@ export function apply(ctx, config) {
         ...tailOfSession(live),
       }
     }
-    try {
-      const inspected = await ctx.sessionController.inspect(sessionId)
-      const lastSeq = inspected.events.at(-1)?.seq
-      return {
-        ok: true,
-        sessionId,
-        live: false,
-        running: false,
-        seq: lastSeq ?? 0,
-        sinceSeq: lastSeq ?? 0,
-        ...tailOfEvents(inspected.events),
-      }
-    } catch (error) {
-      throw new HttpError(404, `session not found: ${sessionId} (${describe(error)})`)
+    const inspected = await inspectSession(sessionId)
+    const lastSeq = inspected?.events?.at(-1)?.seq ?? 0
+    return {
+      ...record,
+      ok: true,
+      sessionId,
+      live: false,
+      running: false,
+      seq: lastSeq,
+      sinceSeq: lastSeq,
+      ...tailOfEvents(inspected?.events),
     }
   }
 
   // ------------------------------------------------------------ session work
 
-  async function ensureKnown(sessionId) {
-    if (ctx.sessions.get(sessionId) !== undefined) return
+  async function knownHeader(sessionId) {
+    const live = ctx.sessions.get(sessionId)
+    if (live !== undefined) return live.header
+    return (await inspectSession(sessionId)).meta
+  }
+
+  /**
+   * /send 需要两样东西：会话头（判断能不能续聊）和续聊起点 seq。
+   * 冷会话只 inspect 一次就把两样都拿到；起点取旧日志的最后一个 seq，
+   * 这样 resume 之后 wait 只扫新事件，不会把整份历史重读一遍
+   * （冷会话的 currentSeq() 是 -1，用它当起点会让游标回落到 0）。
+   */
+  async function resumeTarget(sessionId) {
+    const live = ctx.sessions.get(sessionId)
+    if (live !== undefined) return { header: live.header, sinceSeq: Number(live.seq) }
+    const inspected = await inspectSession(sessionId)
+    return { header: inspected.meta, sinceSeq: inspected?.events?.at(-1)?.seq ?? -1 }
+  }
+
+  async function inspectSession(sessionId) {
     try {
-      await ctx.sessionController.inspect(sessionId)
+      return await ctx.sessionController.inspect(sessionId)
     } catch (error) {
       throw new HttpError(404, `session not found: ${sessionId} (${describe(error)})`)
     }
   }
 
-  async function createSession({ cwd, preset, title }) {
+  async function createSession({ cwd, preset, title, workspace }) {
     const presetField = preset === '' ? {} : { agentPreset: preset }
-    const workspace = await findWorkspace(cwd)
+    // 没有显式指定 workspace 时，仍按 cwd 找已注册的 workspace（原有行为）。
+    const target = workspace ?? (await findWorkspace(cwd))
     let created
     try {
       created = await ctx.sessionController.create(
-        workspace === undefined ? { ...presetField, cwd } : { ...presetField, workspaceId: workspace.id },
+        target === undefined ? { ...presetField, cwd } : { ...presetField, workspaceId: target.id },
       )
     } catch (error) {
-      if (workspace === undefined) throw new HttpError(400, `failed to create a DSH session: ${describe(error)}`)
+      if (target === undefined) throw new HttpError(400, `failed to create a DSH session: ${describe(error)}`)
       // The workspace may reject the attach; fall back to a plain cwd session.
+      log(`session not attached to workspace ${target.id ?? target.path}: ${describe(error)}`)
       created = await ctx.sessionController.create({ ...presetField, cwd })
     }
     const sessionId = String(created.sessionId)
@@ -408,6 +556,209 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 解析 POST /task 的 workspace 目标：显式 workspace 优先，其次 cwd。
+   * 优先级 workspaceId > workspacePath > workspaceTitle；workspacePath 可配
+   * createWorkspace=true 就地注册一个新 workspace。
+   */
+  async function resolveWorkspaceTarget(body) {
+    const workspaceId = optionalText(body?.workspaceId)
+    const workspacePath = optionalText(body?.workspacePath)
+    const workspaceTitle = optionalText(body?.workspaceTitle)
+    const createWorkspace = body?.createWorkspace === true
+    const cwd = body?.cwd === undefined ? undefined : await resolveDirectory(body.cwd)
+    if (workspaceId === undefined && workspacePath === undefined && workspaceTitle === undefined) {
+      return { workspace: undefined, cwd: cwd ?? (await resolveDirectory(undefined)) }
+    }
+    const registry = ctx.get('workspaceRegistry')
+    if (registry === undefined) throw new HttpError(503, 'this DSH deployment has no workspace registry')
+    let workspace
+    if (workspaceId !== undefined) {
+      workspace = registry.get(workspaceId)
+      if (workspace === undefined) throw new HttpError(404, `workspace not found: ${workspaceId}`)
+    } else if (workspacePath !== undefined) {
+      const absolute = await resolveDirectory(workspacePath)
+      workspace = await findWorkspace(absolute)
+      if (workspace === undefined && createWorkspace) {
+        try {
+          workspace = workspaceTitle === undefined ? await registry.create(absolute) : await registry.create(absolute, workspaceTitle)
+        } catch (error) {
+          throw new HttpError(400, `DSH could not create the workspace: ${describe(error)}`)
+        }
+      }
+      if (workspace === undefined) {
+        throw new HttpError(404, `no workspace is registered for ${absolute}: pass createWorkspace: true to create one`)
+      }
+    } else {
+      const matches = registry.list().filter((entry) => entry.title === workspaceTitle)
+      if (matches.length === 0) throw new HttpError(404, `no workspace is titled "${workspaceTitle}"`)
+      if (matches.length > 1) throw new HttpError(409, `workspace title is ambiguous: "${workspaceTitle}"`)
+      workspace = matches[0]
+    }
+    if (cwd !== undefined && normalizePath(cwd) !== normalizePath(workspace.path)) {
+      throw new HttpError(400, `cwd and workspace disagree: "${cwd}" is not "${workspace.path}"`)
+    }
+    return { workspace, cwd: workspace.path }
+  }
+
+  /**
+   * 把请求里的 provider/model/reasoningEffort 落到会话上（selectModel）。
+   * 三样都没给就完全不动，保持“不指定即默认”。注意 DSH 的 selectModel 会把
+   * 这次选择顺带存成部署默认，这是它的原生行为，本插件不还原、不加开关。
+   */
+  async function applyModel(sessionId, body) {
+    const provider = optionalText(body?.provider)
+    const model = optionalText(body?.model)
+    const reasoningEffort = optionalText(body?.reasoningEffort)
+    if (provider === undefined && model === undefined && reasoningEffort === undefined) return undefined
+    const current = modelView(currentSelection())
+    const selection = { provider: provider ?? current?.provider, model: model ?? current?.model }
+    const effort = reasoningEffort ?? current?.reasoningEffort
+    if (effort !== undefined && effort !== null) selection.reasoningEffort = effort
+    if (selection.provider === undefined || selection.model === undefined) {
+      throw new HttpError(400, 'model selection needs a model: pass model, and provider when it is not the deployment default')
+    }
+    try {
+      const value = await ctx.sessionController.selectModel({ sessionId, ...selection })
+      return modelView(value?.selected) ?? selection
+    } catch (error) {
+      throw new HttpError(400, `DSH refused the model selection: ${describe(error)}`)
+    }
+  }
+
+  /** /send 不接受 workspace 字段：会话的 workspace 在创建时就固定了。 */
+  function rejectWorkspaceFields(body) {
+    for (const field of ['workspaceId', 'workspacePath', 'workspaceTitle', 'createWorkspace']) {
+      if (body?.[field] !== undefined) {
+        throw new HttpError(
+          400,
+          `workspace/immutable: a session keeps the workspace it was created in; "${field}" is only accepted by POST /task`,
+        )
+      }
+    }
+  }
+
+  /**
+   * 归档会话与子代理会话都推不动：前者被 agent/pre-step 拒绝，后者不允许被
+   * resume。提前给出明确错误，避免调用方发出提示后一直等到超时。
+   */
+  function assertResumable(sessionId, header) {
+    if (header?.origin === 'subagent') {
+      throw new HttpError(400, `session/not-resumable: "${sessionId}" belongs to a subagent and cannot be continued from here`)
+    }
+    if (isArchived(sessionId)) {
+      throw new HttpError(400, `session/archived: "${sessionId}" is archived; unarchive it in DSH before sending another prompt`)
+    }
+  }
+
+  /**
+   * 把列表行与单会话精读折叠成同一个会话形状，避免两处口径漂移。
+   * model 取投影的 next（该会话下一次请求会用的模型），与 lastUsed 不同时
+   * 另带 modelLastUsed；投影缺失时两项都为 null，modelSource 为 unknown。
+   */
+  function sessionRecord({ sessionId, hints, row, header, live, agent, archived }) {
+    const values = hints?.values ?? {}
+    const selection = values.modelSelection
+    const lastUsed = modelView(selection?.lastUsed)
+    const next = modelView(selection?.next)
+    const cwd = row?.cwd ?? header?.cwd ?? null
+    const workspace = workspaceOfPath(cwd)
+    const origin = row?.origin ?? header?.origin
+    const parentSessionId = row?.parentSessionId ?? header?.parentSession
+    const flagged = archived.has(String(sessionId))
+    return {
+      sessionId: String(sessionId),
+      title: typeof values.title === 'string' && values.title !== '' ? values.title : null,
+      cwd,
+      workspace: workspace === undefined ? null : workspaceView(workspace),
+      model: next ?? lastUsed ?? null,
+      ...(lastUsed !== undefined && next !== undefined && !sameModelView(lastUsed, next) ? { modelLastUsed: lastUsed } : {}),
+      modelSource: hints?.kind ?? 'unknown',
+      live: live !== undefined,
+      running: row?.running ?? agent?.status === 'running',
+      agentAvailable: row?.agentAvailable ?? live !== undefined,
+      blank: row?.blank ?? null,
+      updatedAt: typeof row?.updatedAt === 'number' ? new Date(row.updatedAt).toISOString() : null,
+      ...(parentSessionId === undefined ? {} : { parentSessionId }),
+      ...(origin === undefined ? {} : { origin }),
+      archived: flagged,
+      resumable: origin !== 'subagent' && !flagged,
+    }
+  }
+
+  async function sessionRow(sessionId, header) {
+    const hints = await readProjections(sessionId)
+    return sessionRecord({
+      sessionId,
+      hints,
+      header,
+      live: ctx.sessions.get(sessionId),
+      agent: ctx.agents.get(sessionId),
+      archived: archivedIds(),
+    })
+  }
+
+  /** 单会话精读；投影只是加分项，读不到就少带 title/model 而不影响会话本身。 */
+  async function readProjections(sessionId) {
+    try {
+      return await ctx.sessionController.projections({ sessionId })
+    } catch (error) {
+      log(`projections for ${sessionId} unavailable: ${describe(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * 用 cwd 反查 workspace。故意先用 registry.list() 比对路径，而不是
+   * resolveByPath：后者对不存在的路径会直接 reject（realpath 抛错）。
+   */
+  function workspaceOfPath(cwd) {
+    const registry = ctx.get('workspaceRegistry')
+    if (registry === undefined || cwd === undefined || cwd === null) return undefined
+    const wanted = normalizePath(cwd)
+    try {
+      return registry.list().find((workspace) => normalizePath(workspace.path) === wanted)
+    } catch (error) {
+      log(`workspace lookup failed: ${describe(error)}`)
+      return undefined
+    }
+  }
+
+  function workspaceView(workspace) {
+    return { id: String(workspace.id), title: workspace.title ?? null, path: workspace.path ?? null }
+  }
+
+  function archivedIds() {
+    const ids = ctx.get('workspaceRegistry')?.archivedSessionIds
+    return new Set(Array.isArray(ids) ? ids.map((id) => String(id)) : [])
+  }
+
+  function isArchived(sessionId) {
+    return archivedIds().has(String(sessionId))
+  }
+
+  function currentSelection() {
+    const defaults = ctx.get('agentDefaultModel')
+    try {
+      return defaults?.currentSelection?.()
+    } catch (error) {
+      log(`default model selection unavailable: ${describe(error)}`)
+      return undefined
+    }
+  }
+
+  function modelView(selection) {
+    if (selection === undefined || selection === null) return undefined
+    const provider = optionalText(selection.provider)
+    const model = optionalText(selection.model)
+    if (provider === undefined || model === undefined) return undefined
+    return { provider, model, reasoningEffort: optionalText(selection.reasoningEffort) ?? null }
+  }
+
+  function sameModelView(left, right) {
+    return left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort
+  }
+
   async function resolveDirectory(input) {
     const raw = optionalText(input) ?? options.defaultCwd
     let directory
@@ -462,6 +813,7 @@ function normalizeOptions(config) {
     agentPreset: optionalText(source.agentPreset) ?? '',
     waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 600, 1, 3600),
     maxWaitSeconds: clampNumber(source.maxWaitSeconds, 1800, 1, 3600),
+    listLimit: clampNumber(source.listLimit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT),
     token: optionalText(source.token) ?? '',
   }
 }
@@ -473,7 +825,15 @@ function expandHome(path) {
   return raw
 }
 
+/** 比较路径时忽略结尾分隔符；Windows 上大小写不敏感。 */
+function normalizePath(path) {
+  const text = String(path).replace(/[\\/]+$/, '')
+  return process.platform === 'win32' ? text.toLowerCase() : text
+}
+
 function clampNumber(value, fallback, min, max) {
+  // 缺失的查询参数是 null（或空串），不能当成数字 0，否则 limit 会被夹到 1。
+  if (value === undefined || value === null || String(value).trim() === '') return fallback
   const number = Number(value)
   if (!Number.isFinite(number)) return fallback
   return Math.min(Math.max(Math.trunc(number), min), max)

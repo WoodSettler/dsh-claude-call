@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Claude Code Bridge",
-    "description": "Lets Claude Code wake a DSH session, dispatch a task, and read the answer back over a loopback HTTP bridge."
+    "description": "Lets Claude Code list DSH sessions, workspaces and models, wake a session in a chosen workspace and model, dispatch a task, and read the answer back over a loopback HTTP bridge."
   }
 }
