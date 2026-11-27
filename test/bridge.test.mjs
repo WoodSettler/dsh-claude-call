@@ -116,7 +116,6 @@ function createHarness(overrides = {}) {
     },
     async prompt(request, signal) {
       assert.ok(signal instanceof AbortSignal)
-      if (overrides.prompt) return overrides.prompt(request, store)
       let session = store.get(request.sessionId)
       if (session === undefined) {
         // 冷会话：DSH 会在 prompt 时从持久化日志 resume。这里按 cold 覆盖项重建同一段历史，
@@ -128,6 +127,7 @@ function createHarness(overrides = {}) {
         for (const event of overrides.cold?.events ?? []) session.events.push(event)
         store.set(request.sessionId, session)
       }
+      if (overrides.prompt) return overrides.prompt(request, session, store)
       const text = request.content[0].text
       session.append('user/message', {
         role: 'user',
@@ -511,8 +511,68 @@ test('send resumes a cold session without rescanning its old log', async (t) => 
   assert.equal(sent.status, 200, JSON.stringify(sent.body))
   assert.equal(sent.body.status, 'done')
   assert.equal(sent.body.text, 'pong')
-  // 起点必须是旧日志的最后一个 seq，而不是冷会话的 currentSeq() = -1。
-  assert.equal(sent.body.sinceSeq, history.length - 1)
+  // 起点是旧日志长度（下一个事件的序号），不再是冷会话的 currentSeq() = -1。
+  assert.equal(sent.body.sinceSeq, history.length)
   assert.equal(harness.store.get('session-cold').events.length, history.length + 3)
+})
+
+test('a resumed cold session never reports the old answer as the new one', async (t) => {
+  const history = [
+    {
+      type: 'assistant/message',
+      seq: 0,
+      time: Date.now(),
+      data: { message: { role: 'assistant', content: [{ type: 'text', text: '旧答复' }] } },
+    },
+  ]
+  const cold = {
+    meta: { id: 'session-cold', createdAt: Date.now(), isSeeded: false, cwd: 'C:\\work\\demo' },
+    events: history,
+  }
+  const { call } = await mount(t, {
+    cold,
+    // 本轮只落 turn/end、不产出新文本：旧答复绝不能被当成本轮结果。
+    prompt(request, session) {
+      session.append('user/message', {
+        role: 'user',
+        content: [{ type: 'text', text: request.content[0].text }],
+        source: { kind: 'user', rpcId: request.requestId },
+      })
+      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      return { accepted: true }
+    },
+  })
+
+  const sent = await call('/send', {
+    method: 'POST',
+    body: { sessionId: 'session-cold', prompt: '接着上次', timeoutSeconds: 5 },
+  })
+  assert.equal(sent.status, 200, JSON.stringify(sent.body))
+  assert.equal(sent.body.status, 'done')
+  assert.equal(sent.body.text, '')
+})
+
+test('status reports a sinceSeq that still catches the next turn', async (t) => {
+  const { call } = await mount(t, {})
+  const first = await call('/task', { method: 'POST', body: { prompt: '第一轮', timeoutSeconds: 5 } })
+  assert.equal(first.body.status, 'done')
+
+  const state = await call(`/status?sessionId=${first.body.sessionId}`)
+  assert.equal(state.status, 200, JSON.stringify(state.body))
+  // sinceSeq 是"最后观测到的序号"，比 seq 小一，所以紧接着写入的 turn/end 仍算在它之后。
+  assert.equal(state.body.sinceSeq, state.body.seq - 1)
+  assert.equal(state.body.lastAssistantText, 'pong')
+})
+
+test('wait refuses a missing sinceSeq', async (t) => {
+  const { call } = await mount(t, {})
+  const created = await call('/task', { method: 'POST', body: { prompt: '第一轮', wait: false } })
+
+  const refused = await call('/wait', {
+    method: 'POST',
+    body: { sessionId: created.body.sessionId, timeoutSeconds: 1 },
+  })
+  assert.equal(refused.status, 400)
+  assert.match(refused.body.error, /sinceSeq is required/)
 })
 

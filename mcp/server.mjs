@@ -21,7 +21,8 @@ const ENDPOINT_FILE =
   process.env.DSH_CLAUDE_CALL_ENDPOINT ??
   join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'claude-call', 'endpoint.json')
 const DEFAULT_WAIT_SECONDS = 40
-const MAX_WAIT_SECONDS = 300
+// 单次同步等待必须短于 Node/undici 客户端默认的 ~300 秒响应头超时，否则 fetch 会先中止。
+const MAX_WAIT_SECONDS = 240
 const MAX_LIST_LIMIT = 200
 const HTTP_SLACK_MS = 20_000
 
@@ -134,7 +135,7 @@ const TOOLS = [
   {
     name: 'dsh_wait',
     description:
-      'Block until the next DSH turn in a session finishes, then return its latest answer. Use the sinceSeq returned by dsh_task or dsh_status. Returns status "running" if the budget expires first, so you can call it again.',
+      'Block until the next DSH turn in a session finishes, then return its latest answer. Requires the sinceSeq returned by dsh_task or dsh_status: only a turn that ends after that sequence counts, so an old turn is never reported as the answer. Returns status "running" if the budget expires first, so you can call it again.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -148,7 +149,7 @@ const TOOLS = [
           description: `Wait budget in seconds (1-${MAX_WAIT_SECONDS}). Defaults to 45.`,
         },
       },
-      required: ['sessionId'],
+      required: ['sessionId', 'sinceSeq'],
       additionalProperties: false,
     },
   },
@@ -248,12 +249,12 @@ const HANDLERS = {
   },
 
   async dsh_wait(args) {
-    const timeoutSeconds = clampSeconds(args.timeoutSeconds, 45)
-    const body = {
-      sessionId: args.sessionId,
-      timeoutSeconds,
-      ...(Number.isFinite(args.sinceSeq) ? { sinceSeq: Number(args.sinceSeq) } : {}),
+    const sinceSeq = Number(args.sinceSeq)
+    if (!Number.isFinite(sinceSeq)) {
+      throw new Error('sinceSeq is required: pass the sinceSeq returned by dsh_task or dsh_status')
     }
+    const timeoutSeconds = clampSeconds(args.timeoutSeconds, 45)
+    const body = { sessionId: args.sessionId, sinceSeq, timeoutSeconds }
     const outcome = await call('/wait', { method: 'POST', body, timeoutMs: timeoutSeconds * 1000 + HTTP_SLACK_MS })
     return formatOutcome(outcome)
   },
@@ -305,14 +306,33 @@ async function call(path, { method = 'GET', body, query, timeoutMs = 60_000 }) {
     if (value !== undefined) url.searchParams.set(key, String(value))
   }
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(new Error(`DSH bridge did not answer within ${timeoutMs} ms`)), timeoutMs)
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
   try {
-    const response = await fetch(url, {
-      method,
-      headers: { 'content-type': 'application/json', 'x-claude-call-token': endpoint.token },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-    })
+    let response
+    try {
+      response = await fetch(url, {
+        method,
+        headers: { 'content-type': 'application/json', 'x-claude-call-token': endpoint.token },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      })
+    } catch (error) {
+      // 超时和"桥根本没起来"是两件不同的事，给调用方的提示也不同。
+      if (timedOut) {
+        throw new Error(
+          `DSH bridge did not answer within ${timeoutMs} ms. The turn is probably still running: ` +
+            'call dsh_status to read the session, then dsh_wait with a fresh sinceSeq.',
+        )
+      }
+      throw new Error(
+        `Cannot reach the DSH bridge at ${endpoint.origin} (${error?.message ?? error}). ` +
+          'Is DSH running with the dsh-claude-call plugin enabled?',
+      )
+    }
     const text = await response.text()
     let payload
     try {

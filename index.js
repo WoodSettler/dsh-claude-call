@@ -19,8 +19,8 @@
  *   port                 bind port, 0 = ephemeral (default 0)
  *   defaultCwd           directory used when a request names none
  *   agentPreset          default Agent preset for spawned sessions
- *   waitTimeoutSeconds   default wait budget (default 600)
- *   maxWaitSeconds       hard cap for one wait (default 1800)
+ *   waitTimeoutSeconds   default wait budget (default 120)
+ *   maxWaitSeconds       hard cap for one synchronous wait (default 240)
  *   listLimit            default page size for GET /sessions (default 20)
  *   token                fixed token instead of a random per-process one
  *
@@ -202,12 +202,15 @@ export function apply(ctx, config) {
     const sessionId = await createSession({ cwd: target.cwd, preset, title, workspace: target.workspace })
     // 只有显式给了 model/provider/reasoningEffort 才切换；否则沿用 DSH 的部署默认。
     const model = await applyModel(sessionId, body)
-    const sinceSeq = currentSeq(sessionId)
+    const scanFrom = currentSeq(sessionId)
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
+    // 本轮可能在本行之前就已落下 turn/end，上报的 sinceSeq 必须把它覆盖住。
+    const sinceSeq = Math.max(scanFrom, currentSeq(sessionId) - 1)
     return finish({
       sessionId,
       title,
+      scanFrom,
       sinceSeq,
       requestId,
       body,
@@ -221,16 +224,17 @@ export function apply(ctx, config) {
     const sessionId = requireId(body?.sessionId)
     const prompt = requireText(body?.prompt, 'prompt')
     rejectWorkspaceFields(body)
-    const { header, sinceSeq } = await resumeTarget(sessionId)
+    const { header, nextSeq } = await describeSession(sessionId)
     assertResumable(sessionId, header)
     const model = await applyModel(sessionId, body)
     const requestId = newRequestId()
     await admit(sessionId, prompt, requestId)
+    const sinceSeq = Math.max(nextSeq, currentSeq(sessionId) - 1)
     const title = optionalText(body?.title) ?? ''
-    return finish({ sessionId, title, sinceSeq, requestId, body, wait: body?.wait !== false, model })
+    return finish({ sessionId, title, scanFrom: nextSeq, sinceSeq, requestId, body, wait: body?.wait !== false, model })
   }
 
-  async function finish({ sessionId, title, sinceSeq, requestId, body, wait, model, workspace }) {
+  async function finish({ sessionId, title, scanFrom, sinceSeq, requestId, body, wait, model, workspace }) {
     const base = {
       ok: true,
       sessionId,
@@ -243,17 +247,21 @@ export function apply(ctx, config) {
     }
     if (!wait) return { ...base, status: 'dispatched', text: '', turnEndReason: null }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
-    const outcome = await waitForTurn(sessionId, { requestId, afterSeq: sinceSeq }, limitMs)
+    const outcome = await waitForTurn(sessionId, { requestId, afterSeq: scanFrom }, limitMs)
     return { ...base, ...outcome }
   }
 
   async function wait(body) {
     const sessionId = requireId(body?.sessionId)
     await knownHeader(sessionId)
-    const sinceSeq = Number.isFinite(body?.sinceSeq) ? Number(body.sinceSeq) : -1
+    const rawSinceSeq = body?.sinceSeq
+    // 不给起点就等着"下一轮"，很容易把历史里的旧答复当成答案，所以直接拒掉。
+    if (typeof rawSinceSeq !== 'number' || !Number.isFinite(rawSinceSeq)) {
+      throw new HttpError(400, 'sinceSeq is required: pass the sinceSeq returned by dsh_task or dsh_status')
+    }
     const limitMs = waitBudget(body?.timeoutSeconds) * 1000
-    const outcome = await waitForTurn(sessionId, { requestId: '', afterSeq: sinceSeq }, limitMs)
-    return { ok: true, sessionId, sinceSeq, ...outcome }
+    const outcome = await waitForTurn(sessionId, { requestId: '', afterSeq: rawSinceSeq }, limitMs)
+    return { ok: true, sessionId, sinceSeq: rawSinceSeq, ...outcome }
   }
 
   function cancel(body) {
@@ -375,19 +383,20 @@ export function apply(ctx, config) {
         live: true,
         running: agent?.status === 'running',
         seq: Number(live.seq),
-        sinceSeq: Number(live.seq),
+        // sinceSeq 是"最后观测到的序号"：紧接着写入的 turn/end（seq === seq）仍算在它之后。
+        sinceSeq: Number(live.seq) - 1,
         ...tailOfSession(live),
       }
     }
     const inspected = await inspectSession(sessionId)
-    const lastSeq = inspected?.events?.at(-1)?.seq ?? 0
+    const lastSeq = inspected?.events?.at(-1)?.seq ?? -1
     return {
       ...record,
       ok: true,
       sessionId,
       live: false,
       running: false,
-      seq: lastSeq,
+      seq: lastSeq + 1,
       sinceSeq: lastSeq,
       ...tailOfEvents(inspected?.events),
     }
@@ -402,16 +411,17 @@ export function apply(ctx, config) {
   }
 
   /**
-   * /send 需要两样东西：会话头（判断能不能续聊）和续聊起点 seq。
-   * 冷会话只 inspect 一次就把两样都拿到；起点取旧日志的最后一个 seq，
-   * 这样 resume 之后 wait 只扫新事件，不会把整份历史重读一遍
+   * /send 需要三样东西：会话头（判断能不能续聊）、续聊扫描起点 nextSeq。
+   * 冷会话只 inspect 一次就全拿到；nextSeq 取"下一个事件将用的序号"=旧日志长度，
+   * 这样 resume 之后只扫新事件，也不会把整份历史重读一遍
    * （冷会话的 currentSeq() 是 -1，用它当起点会让游标回落到 0）。
    */
-  async function resumeTarget(sessionId) {
+  async function describeSession(sessionId) {
     const live = ctx.sessions.get(sessionId)
-    if (live !== undefined) return { header: live.header, sinceSeq: Number(live.seq) }
+    if (live !== undefined) return { live: true, header: live.header, nextSeq: Number(live.seq) }
     const inspected = await inspectSession(sessionId)
-    return { header: inspected.meta, sinceSeq: inspected?.events?.at(-1)?.seq ?? -1 }
+    const lastSeq = inspected?.events?.at(-1)?.seq
+    return { live: false, header: inspected.meta, nextSeq: (lastSeq ?? -1) + 1 }
   }
 
   async function inspectSession(sessionId) {
@@ -499,6 +509,10 @@ export function apply(ctx, config) {
           state.messageSeq = seq
         }
       } else if (event.type === 'assistant/message') {
+        // 只认本次 prompt（或调用方给的游标）之后产出的文本：resume 过的会话会把整份
+        // 历史重新喂给 scan()，旧答复不能当成本轮结果。
+        const lower = state.requestId !== '' ? state.messageSeq : state.afterSeq
+        if (lower < 0 || seq <= lower) continue
         const text = textOfMessage(event.data?.message)
         if (text !== '') state.text = text
       } else if (event.type === 'turn/end') {
@@ -811,8 +825,10 @@ function normalizeOptions(config) {
     port: clampNumber(source.port, 0, 0, 65535),
     defaultCwd: optionalText(source.defaultCwd) ?? '',
     agentPreset: optionalText(source.agentPreset) ?? '',
-    waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 600, 1, 3600),
-    maxWaitSeconds: clampNumber(source.maxWaitSeconds, 1800, 1, 3600),
+    // 单次同步等待压在 Node/undici 客户端默认的 ~300 秒响应头超时之内；
+    // 更长的活请用 wait:false 派发，再靠 dsh_status / dsh_wait 轮询。
+    waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 120, 1, 3600),
+    maxWaitSeconds: clampNumber(source.maxWaitSeconds, 240, 1, 3600),
     listLimit: clampNumber(source.listLimit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT),
     token: optionalText(source.token) ?? '',
   }

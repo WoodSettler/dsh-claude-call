@@ -64,7 +64,7 @@ claude mcp remove -s user dsh-call
 |---|---|---|
 | `dsh_task` | 新建 DSH 会话并派任务；默认等一会儿拿答复 | `prompt`（必填）、`cwd`、`title`、`agentPreset`、`workspaceId` / `workspacePath` / `workspaceTitle`、`createWorkspace`、`provider` / `model` / `reasoningEffort`、`wait`（默认 true）、`timeoutSeconds`（默认 40） |
 | `dsh_send` | 往已有会话追加上下文（可换模型） | `sessionId`、`prompt`、`provider` / `model` / `reasoningEffort`、`wait`、`timeoutSeconds` |
-| `dsh_wait` | 等下一轮结束，返回最新答复 | `sessionId`、`sinceSeq`、`timeoutSeconds`（默认 45） |
+| `dsh_wait` | 等下一轮结束，返回最新答复 | `sessionId`、`sinceSeq`（必填）、`timeoutSeconds`（默认 45） |
 | `dsh_status` | 不等待，读运行状态 + 最近答复 | `sessionId` |
 | `dsh_cancel` | 取消当前轮（保留队列） | `sessionId` |
 | `dsh_sessions` | 列历史会话（默认 20 条，最新在前）：标题、cwd、workspace、模型与推理等级、运行/可续状态 | `sessionId`（只精读这一个）、`limit`、`workspace`（按 id / 标题 / cwd 过滤） |
@@ -72,7 +72,9 @@ claude mcp remove -s user dsh-call
 | `dsh_models` | 列可用模型（按 provider 分组）与各自支持的 `reasoningEffort`，并给出部署默认 | — |
 
 等待超时不会失败，而是返回 `status: "running"` 和 `sinceSeq`，让调用方用 `dsh_wait` 续等——
-这样不会被 Claude Code 的 MCP 工具超时截断。
+这样不会被 Claude Code 的 MCP 工具超时截断。`sinceSeq` 只统计**在该序号之后结束**的轮次，
+所以历史里的旧答复不会被当成新一轮的结果；`dsh_wait` 因此要求必须给 `sinceSeq`（不给就 400），
+避免"随便等一轮"把旧答复当答案。
 
 ### 会话、workspace 与模型
 
@@ -111,8 +113,8 @@ claude mcp remove -s user dsh-call
 | `port` | `0` | 0 = 内核分配；固定端口便于排查 |
 | `defaultCwd` | 会话默认目录 | 请求不带 `cwd` 时用 |
 | `agentPreset` | 部署默认 preset | 新建会话的 Agent preset |
-| `waitTimeoutSeconds` | `600` | 单次 `wait` 默认预算 |
-| `maxWaitSeconds` | `1800` | 单次 `wait` 硬上限 |
+| `waitTimeoutSeconds` | `120` | 单次同步 `wait` 默认预算 |
+| `maxWaitSeconds` | `240` | 单次同步 `wait` 硬上限（见「已知限制」第 2 条） |
 | `listLimit` | `20` | `GET /sessions` 默认返回条数（上限 200） |
 | `token` | 随机 | 想固定 token（例如写自己的脚本）时用 |
 
@@ -128,7 +130,7 @@ claude mcp remove -s user dsh-call
 | `GET /models` | — | `{ok, default, routableProviders, count, groups: [{id, name, models: [{id, name, description?, reasoningEfforts, defaultEffort?}]}], failures}` |
 | `POST /task` | `{prompt, cwd?, title?, agentPreset?, workspaceId?, workspacePath?, workspaceTitle?, createWorkspace?, provider?, model?, reasoningEffort?, wait?, timeoutSeconds?}` | `{ok, sessionId, title, status, text, turnEndReason, sinceSeq, requestId, model?, workspace?}` |
 | `POST /send` | `{sessionId, prompt, provider?, model?, reasoningEffort?, wait?, timeoutSeconds?}` | 同上（带 workspace 字段则 400 `workspace/immutable`） |
-| `POST /wait` | `{sessionId, sinceSeq?, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason}` |
+| `POST /wait` | `{sessionId, sinceSeq, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason}` |
 | `GET /status?sessionId=` | — | `{...会话记录, running, live, lastAssistantText, lastTurnEndReason, seq, sinceSeq}` |
 | `POST /cancel` | `{sessionId}` | `{cancelled: true}` |
 
@@ -140,10 +142,10 @@ node test/bridge.test.mjs   # 或 node --test test/
 ```
 
 测试用一个 stub Cordis 上下文直接挂载插件，覆盖：token 认证、建会话 + 等待 + 取答复、`wait:false`、
-`wait`/`status` 一致性、续聊、未知会话/路由、卸载时删除发现文件，以及本轮新增的
-会话发现（workspace / 模型 / 可续状态）、单会话精读、workspace 与模型目录、创建时指定
-workspace 与模型、`dsh_send` 拒绝 workspace 字段并换模型、归档与子代理会话的拦截、冷会话
-resume 的扫描起点。共 15 个测试，**不依赖运行中的 DSH**。
+`wait`/`status` 一致性、`sinceSeq` 边界、续聊、冷会话（重启后 `send`）与其扫描起点、旧答复不被当成本轮结果、
+`sinceSeq` 缺失被拒、未知会话/路由、卸载时删除发现文件，以及本轮新增的会话发现（workspace / 模型 /
+可续状态）、单会话精读、workspace 与模型目录、创建时指定 workspace 与模型、`dsh_send` 拒绝 workspace
+字段并换模型、归档与子代理会话的拦截。共 18 个测试，**不依赖运行中的 DSH**。
 
 沙箱提示：DSH 的沙箱不允许 `node --test` 通过管道 spawn 子进程，直接跑 `node --test test/`
 会报 `Error: spawn EPERM`；用上面的**进程内**跑法 `node test/bridge.test.mjs` 即可。
@@ -152,18 +154,21 @@ resume 的扫描起点。共 15 个测试，**不依赖运行中的 DSH**。
 
 1. **改插件代码后需要重启 DSH**：DSH 的 Loader/Node 模块缓存不会在 profile 重组时丢弃已加载的
    ESM 模块，所以 `index.js` 的改动只有重启后生效（这是 DSH 的现有行为，不是本插件特有）。
-2. **不代改权限策略**：新会话沿用 DSH 当前的沙箱与审批策略；遇到需要人工 approval 的工具调用，
+2. **单次同步等待不超过 240 秒**：Node/undici 的 `fetch` 默认在约 300 秒内收不到响应头就会中止，桥把默认
+   等待压到 120 秒、硬上限 240 秒；更长的工作请用 `wait: false` 派发，再用 `dsh_status` / `dsh_wait` 轮询。
+   用 curl 之类没有该限制的客户端时，可在配置里把 `maxWaitSeconds` 调大。
+3. **不代改权限策略**：新会话沿用 DSH 当前的沙箱与审批策略；遇到需要人工 approval 的工具调用，
    会话会等你在 DSH UI 里点确认。桥不会自动提权、不会把 policy 改成 `never`。
-3. **没有流式输出**：只返回轮次结束后的最终文本；过程中的工具调用细节去 DSH 会话里看。
-4. **单机、单用户**：token 放在本机文件里，同机其他进程理论上可读；这是单人本机场景的取舍。
-5. **workspace 在创建时就定格**：DSH 的会话归属由 cwd 的 canonical 路径决定，
+4. **没有流式输出**：只返回轮次结束后的最终文本；过程中的工具调用细节去 DSH 会话里看。
+5. **单机、单用户**：token 放在本机文件里，同机其他进程理论上可读；这是单人本机场景的取舍。
+6. **workspace 在创建时就定格**：DSH 的会话归属由 cwd 的 canonical 路径决定，
    `Workspace.attachSession()` 只接受 cwd 恰好等于 workspace 路径的会话，所以**已存在的会话不能改挂到别的
    workspace**。桥的回应是：`POST /task` 收 workspace 字段，`POST /send` 带这些字段直接返回
    `workspace/immutable`。
-6. **指定模型会顺带改 DSH 的全局默认模型**：`sessionController.selectModel()` 除了设置会话模型，还会在后台把
+7. **指定模型会顺带改 DSH 的全局默认模型**：`sessionController.selectModel()` 除了设置会话模型，还会在后台把
    这次选择存成**部署默认**（DSH 原生行为，且不 await）。桥按约定**不还原、不加开关**；只有显式传了
    `model` / `reasoningEffort` 才会触发，不传就完全不动。
-7. **归档会话与子代理会话不能续聊**：归档会话的 prompt 会被接受，但 `agent/pre-step` 会直接拒绝它（表现为
+8. **归档会话与子代理会话不能续聊**：归档会话的 prompt 会被接受，但 `agent/pre-step` 会直接拒绝它（表现为
    发得出去、永远推不动）；`origin === 'subagent'` 的会话不允许被 resume。桥现在提前拦截，分别返回
    `session/archived` 与 `session/not-resumable`，并在 `dsh_sessions` 里标出 `archived` 与 `resumable: false`。
 
