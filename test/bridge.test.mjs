@@ -40,6 +40,7 @@ function createHarness(overrides = {}) {
   const logLines = []
   const created = []
   const selections = []
+  const renames = []
 
   // workspace 注册表的替身：路径比较、archived 标记与 create 都按 DSH 的形状提供。
   const workspaces = overrides.workspaces ?? []
@@ -71,6 +72,7 @@ function createHarness(overrides = {}) {
       if (key === 'agentDefaultModel') {
         return overrides.agentDefaultModel ?? { currentSelection: () => ({ provider: 'sst', model: 'deepseek-flash', reasoningEffort: 'xhigh' }) }
       }
+      if (key === 'schedule') return overrides.schedule
       return undefined
     },
     sessions: {
@@ -112,6 +114,7 @@ function createHarness(overrides = {}) {
       return overrides.modelCatalog ?? { default: null, routableProviders: [], groups: [], failures: [] }
     },
     async rename(request) {
+      renames.push(request)
       return { title: request.title, seq: 0 }
     },
     async prompt(request, signal) {
@@ -169,7 +172,9 @@ function createHarness(overrides = {}) {
     logLines,
     created,
     selections,
+    renames,
     workspaces,
+    schedule: overrides.schedule,
     async dispose() {
       for (const timer of timers) clearTimeout(timer)
       for (const dispose of disposers.reverse()) await dispose()
@@ -180,8 +185,10 @@ function createHarness(overrides = {}) {
 async function mount(t, overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'claude-call-test-'))
   const endpointFile = join(dir, 'endpoint.json')
-  const harness = createHarness({ ...overrides, directory: overrides.directory ?? dir })
-  apply(harness.ctx, { endpointFile, port: 0 })
+  // schedule: null mounts the plugin without a schedule service (503 path).
+  const schedule = overrides.schedule === null ? undefined : (overrides.schedule ?? createScheduleStub())
+  const harness = createHarness({ ...overrides, schedule, directory: overrides.directory ?? dir })
+  apply(harness.ctx, { endpointFile, port: 0, ...(overrides.config ?? {}) })
   t.after(async () => {
     await harness.dispose()
     await rm(dir, { recursive: true, force: true })
@@ -691,5 +698,326 @@ test('turns report an unknown session', async (t) => {
   const missing = await call('/turns?sessionId=session-nope')
   assert.equal(missing.status, 404)
   assert.match(missing.body.error, /session not found/)
+})
+
+// ------------------------------------------------------------ automation tasks
+
+/**
+ * ctx.schedule 的替身：实现桥用到的六个方法，并保留 DSH 的错误码语义
+ * （标题必填、恰好一个时间选择器、update 是整条记录的 compare-and-set、
+ * 删除后从 catalog 消失）。它只服务于本文件的断言，不模拟真实定时器。
+ */
+function createScheduleStub() {
+  const tasks = new Map()
+  const seen = { creates: [], expected: [] }
+  let counter = 0
+
+  function refusal(code, message) {
+    const error = new Error(message)
+    error.code = code
+    return error
+  }
+
+  function selectorKey(request) {
+    const present = ['after_seconds', 'at', 'every_seconds', 'daily', 'weekly', 'cron'].filter(
+      (key) => request?.[key] !== undefined && request?.[key] !== null,
+    )
+    if (present.length !== 1) throw refusal('invalid_selector', `exactly one timing selector is required, got ${present.length}`)
+    return present[0]
+  }
+
+  function buildRecord(request, key) {
+    const record = {
+      id: `schedule-${++counter}`,
+      kind: key === 'after_seconds' ? 'after' : key === 'every_seconds' ? 'every' : key,
+      title: request.title,
+      prompt: request.prompt,
+      scheduledAt: new Date(Date.now() + 3_600_000).toISOString(),
+    }
+    if (key === 'after_seconds') record.afterSeconds = request.after_seconds
+    if (key === 'every_seconds') record.everySeconds = request.every_seconds
+    if (key === 'daily') {
+      record.time = request.daily.time
+      record.timeZone = request.daily.time_zone
+    }
+    if (key === 'weekly') {
+      record.time = request.weekly.time
+      record.timeZone = request.weekly.time_zone
+      record.weekdays = request.weekly.weekdays
+    }
+    if (key === 'cron') {
+      record.expression = request.cron.expression
+      record.timeZone = request.cron.time_zone
+    }
+    return record
+  }
+
+  return {
+    tasks,
+    seen,
+    async create(sessionId, request) {
+      seen.creates.push({ sessionId, request })
+      if (typeof request?.title !== 'string' || request.title.trim() === '') throw refusal('invalid_prompt', 'a title is required')
+      if (typeof request?.prompt !== 'string' || request.prompt.trim() === '') throw refusal('invalid_prompt', 'a prompt is required')
+      const record = buildRecord(request, selectorKey(request))
+      tasks.set(record.id, { sessionId, record, status: 'active', deliveries: [] })
+      return { ...record }
+    },
+    async list(request) {
+      return [...tasks.values()]
+        .filter((task) => task.sessionId === request.sessionId && task.status === 'active')
+        .map((task) => ({ ...task.record }))
+    },
+    async catalog() {
+      return [...tasks.values()].map((task) => ({
+        ...task.record,
+        sessionId: task.sessionId,
+        status: task.status,
+        ...(task.lastDelivery === undefined ? {} : { lastDelivery: task.lastDelivery }),
+      }))
+    },
+    async history(request) {
+      const task = tasks.get(request.id)
+      if (task === undefined || task.sessionId !== request.sessionId) return { id: request.id, code: 'schedule_not_found' }
+      return {
+        id: request.id,
+        records: task.deliveries.slice(-request.limit).reverse(),
+        earlierRecordsUnavailable: false,
+        earlierRecordsPruned: false,
+        retention: { days: 30, records: 200 },
+      }
+    },
+    async update(request) {
+      seen.expected.push(request.expected)
+      const task = tasks.get(request.id)
+      if (task === undefined || task.sessionId !== request.sessionId) {
+        return { id: request.id, updated: false, code: 'schedule_not_found' }
+      }
+      if (task.status !== 'active') return { id: request.id, updated: false, code: 'schedule_ended' }
+      // 只有"改前那一刻"的记录才对得上；这正是桥必须自己回读的原因。
+      if (request.expected?.scheduledAt !== task.record.scheduledAt) {
+        return { id: request.id, updated: false, code: 'schedule_conflict' }
+      }
+      const changed = request.title !== undefined || request.prompt !== undefined || request.change !== undefined
+      // 真实服务对 no-op 也回 updated:false，但带记录、不带错误码。
+      if (!changed) return { id: task.record.id, updated: false, record: { ...task.record } }
+      const next = { ...task.record }
+      if (request.title !== undefined) next.title = request.title
+      if (request.prompt !== undefined) next.prompt = request.prompt
+      if (request.change !== undefined) {
+        next.kind = request.change.kind
+        next.scheduledAt = new Date(Date.now() + 7_200_000).toISOString()
+      }
+      task.record = next
+      return { id: next.id, updated: true, record: { ...next } }
+    },
+    async delete(request) {
+      const task = tasks.get(request.id)
+      if (task === undefined || task.sessionId !== request.sessionId) {
+        return { id: request.id, deleted: false, code: 'schedule_not_found' }
+      }
+      tasks.delete(request.id)
+      return { id: request.id, deleted: true }
+    },
+  }
+}
+
+test('schedule create defaults to a dedicated session', async (t) => {
+  const { call, harness } = await mount(t)
+  const result = await call('/schedule', {
+    method: 'POST',
+    body: {
+      title: '每日站会摘要',
+      prompt: '整理今天的会议纪要并给出待办',
+      daily: { time: '09:00', time_zone: 'Asia/Shanghai' },
+    },
+  })
+  assert.equal(result.status, 200, JSON.stringify(result.body))
+  assert.equal(result.body.mode, 'new-session')
+  assert.equal(result.body.sessionCreated, true)
+  assert.equal(result.body.schedule.kind, 'daily')
+  assert.equal(result.body.schedule.status, 'active')
+  assert.equal(result.body.schedule.sessionId, result.body.sessionId)
+  assert.equal(result.body.schedule.time, '09:00')
+  assert.equal(result.body.schedule.timeZone, 'Asia/Shanghai')
+  // 专用会话确实建了，而且标题带前缀
+  assert.equal(harness.created.length, 1)
+  assert.deepEqual(harness.renames.at(-1), { sessionId: result.body.sessionId, title: '⏰ 每日站会摘要' })
+  // 全机 catalog 能反查到同一条任务
+  const all = await call('/schedules')
+  assert.equal(all.status, 200, JSON.stringify(all.body))
+  assert.equal(all.body.scope, 'all')
+  assert.equal(all.body.count, 1)
+  assert.equal(all.body.items[0].id, result.body.schedule.id)
+  assert.equal(typeof all.body.items[0].scheduledInMs, 'number')
+})
+
+test('schedule create can bind to an existing session', async (t) => {
+  const { call, harness } = await mount(t)
+  const task = await call('/task', { method: 'POST', body: { prompt: '第一轮', wait: false } })
+  const result = await call('/schedule', {
+    method: 'POST',
+    body: { title: '两小时后继续', prompt: '接着处理上一步', after_seconds: 7200, sessionId: task.body.sessionId },
+  })
+  assert.equal(result.status, 200, JSON.stringify(result.body))
+  assert.equal(result.body.mode, 'session')
+  assert.equal(result.body.sessionCreated, false)
+  assert.equal(result.body.sessionId, task.body.sessionId)
+  assert.equal(result.body.schedule.kind, 'after')
+  assert.equal(result.body.schedule.afterSeconds, 7200)
+  // 没有多建会话：只有 /task 那一个
+  assert.equal(harness.created.length, 1)
+  const scoped = await call(`/schedules?sessionId=${task.body.sessionId}`)
+  assert.equal(scoped.body.scope, 'session')
+  assert.equal(scoped.body.count, 1)
+  assert.equal(scoped.body.items[0].status, 'active')
+})
+
+test('schedule create validates the title and the timing selectors', async (t) => {
+  const { call, harness } = await mount(t)
+  const noSelector = await call('/schedule', { method: 'POST', body: { title: 'x', prompt: 'y' } })
+  assert.equal(noSelector.status, 400, JSON.stringify(noSelector.body))
+  assert.match(noSelector.body.error, /exactly one timing selector/)
+
+  const twoSelectors = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x', prompt: 'y', every_seconds: 3600, daily: { time: '09:00', time_zone: 'Asia/Shanghai' } },
+  })
+  assert.equal(twoSelectors.status, 400)
+  assert.match(twoSelectors.body.error, /every_seconds \+ daily/)
+
+  const noTitle = await call('/schedule', { method: 'POST', body: { prompt: 'y', every_seconds: 3600 } })
+  assert.equal(noTitle.status, 400)
+  assert.match(noTitle.body.error, /title must be a non-empty string/)
+
+  const longTitle = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x'.repeat(121), prompt: 'y', every_seconds: 3600 },
+  })
+  assert.equal(longTitle.status, 400)
+  assert.match(longTitle.body.error, /at most 120 characters/)
+
+  // 校验失败不该顺手建会话
+  assert.equal(harness.created.length, 0)
+})
+
+test('schedule refuses to bind to an archived session', async (t) => {
+  const { call, harness } = await mount(t, { archivedSessionIds: ['session-1'] })
+  const task = await call('/task', { method: 'POST', body: { prompt: '先建一个会话', wait: false } })
+  assert.equal(task.body.sessionId, 'session-1')
+  const result = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x', prompt: 'y', every_seconds: 3600, sessionId: 'session-1' },
+  })
+  assert.equal(result.status, 400, JSON.stringify(result.body))
+  assert.match(result.body.error, /session\/archived/)
+  assert.equal(harness.schedule.tasks.size, 0)
+})
+
+test('schedule update renames through compare-and-set, and delete removes the task', async (t) => {
+  const { call, harness } = await mount(t)
+  const created = await call('/schedule', {
+    method: 'POST',
+    body: { title: '旧名字', prompt: '老指令', every_seconds: 3600 },
+  })
+  const id = created.body.schedule.id
+
+  const updated = await call('/schedule/update', {
+    method: 'POST',
+    body: { id, title: '新名字', prompt: '新指令', daily: { time: '08:30', time_zone: 'Asia/Shanghai' } },
+  })
+  assert.equal(updated.status, 200, JSON.stringify(updated.body))
+  assert.equal(updated.body.schedule.title, '新名字')
+  assert.equal(updated.body.schedule.prompt, '新指令')
+  assert.equal(updated.body.schedule.kind, 'daily')
+
+  // expected 必须是"改前那一刻的纯记录"：不带宿主附加字段
+  const expected = harness.schedule.seen.expected.at(-1)
+  assert.equal(expected.sessionId, undefined)
+  assert.equal(expected.status, undefined)
+  assert.equal(expected.title, '旧名字')
+
+  const history = await call(`/schedules/history?id=${id}`)
+  assert.equal(history.status, 200, JSON.stringify(history.body))
+  assert.deepEqual(history.body.records, [])
+  assert.equal(history.body.retention.records, 200)
+
+  const removed = await call('/schedule/delete', { method: 'POST', body: { id } })
+  assert.equal(removed.status, 200, JSON.stringify(removed.body))
+  assert.equal(removed.body.deleted, true)
+  const after = await call('/schedules')
+  assert.equal(after.body.count, 0)
+  const again = await call('/schedule/delete', { method: 'POST', body: { id } })
+  assert.equal(again.status, 404)
+})
+
+test('schedule update with no fields reports an unchanged task', async (t) => {
+  const { call } = await mount(t)
+  const created = await call('/schedule', { method: 'POST', body: { title: 'x', prompt: 'y', every_seconds: 3600 } })
+  const result = await call('/schedule/update', { method: 'POST', body: { id: created.body.schedule.id } })
+  assert.equal(result.status, 200, JSON.stringify(result.body))
+  assert.equal(result.body.unchanged, true)
+  assert.equal(result.body.schedule.title, 'x')
+})
+
+test('schedule update refuses after_seconds and unknown ids', async (t) => {
+  const { call } = await mount(t)
+  const created = await call('/schedule', { method: 'POST', body: { title: 'x', prompt: 'y', every_seconds: 3600 } })
+  const createOnly = await call('/schedule/update', {
+    method: 'POST',
+    body: { id: created.body.schedule.id, after_seconds: 600 },
+  })
+  assert.equal(createOnly.status, 400, JSON.stringify(createOnly.body))
+  assert.match(createOnly.body.error, /create-only/)
+
+  const unknown = await call('/schedule/update', { method: 'POST', body: { id: 'schedule-nope', title: 'z' } })
+  assert.equal(unknown.status, 404)
+  assert.match(unknown.body.error, /schedule_not_found/)
+})
+
+test('schedule writes can be disabled by config, reads stay open', async (t) => {
+  const { call } = await mount(t, { config: { allowScheduleWrite: false } })
+  const created = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x', prompt: 'y', every_seconds: 3600 },
+  })
+  assert.equal(created.status, 403, JSON.stringify(created.body))
+  assert.match(created.body.error, /allowScheduleWrite/)
+
+  const listed = await call('/schedules')
+  assert.equal(listed.status, 200, JSON.stringify(listed.body))
+  assert.equal(listed.body.count, 0)
+})
+
+test('schedule routes report a deployment without the service', async (t) => {
+  const { call } = await mount(t, { schedule: null })
+  const listed = await call('/schedules')
+  assert.equal(listed.status, 503)
+  assert.match(listed.body.error, /no schedule service/)
+
+  const created = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x', prompt: 'y', every_seconds: 3600 },
+  })
+  assert.equal(created.status, 503)
+})
+
+test('a refused create reports the session it already created', async (t) => {
+  const stub = createScheduleStub()
+  stub.create = async () => {
+    const error = new Error('that instant is not in the future')
+    error.code = 'not_future'
+    throw error
+  }
+  const { call, harness } = await mount(t, { schedule: stub })
+  const result = await call('/schedule', {
+    method: 'POST',
+    body: { title: 'x', prompt: 'y', at: '2020-01-01T00:00:00+08:00' },
+  })
+  assert.equal(result.status, 400, JSON.stringify(result.body))
+  assert.match(result.body.error, /schedule\/not_future/)
+  // 会话已经建出来了，错误里必须带上它的 id，避免悄悄留垃圾
+  assert.match(result.body.error, /session-1/)
+  assert.equal(harness.created.length, 1)
 })
 

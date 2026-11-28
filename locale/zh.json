@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Claude Code 呼叫通道",
-    "description": "让 Claude Code 通过本机回环 HTTP 桥列出会话、workspace 与模型，按指定 workspace 和模型唤起 DSH 会话、派发任务并取回答复，还能查看每轮会话的耗时。"
+    "description": "让 Claude Code 通过本机回环 HTTP 桥列出会话、workspace、模型与自动化任务，按指定 workspace 和模型唤起 DSH 会话、派发任务并取回答复，查看每轮耗时，还能新建与编辑定时任务。"
   }
 }

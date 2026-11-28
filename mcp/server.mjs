@@ -17,7 +17,7 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const VERSION = '0.2.1'
+const VERSION = '0.3.0'
 const ENDPOINT_FILE =
   process.env.DSH_CLAUDE_CALL_ENDPOINT ??
   join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'claude-call', 'endpoint.json')
@@ -35,7 +35,104 @@ DSH's final answer; if status is "running", call dsh_wait with the returned sess
 Use dsh_sessions to find earlier DSH work and continue it with dsh_send, or to read which workspace and model a
 session uses. dsh_workspaces and dsh_models list the folders and models you can pass to dsh_task. A session keeps
 the workspace it was created in, so choose the workspace and model at dsh_task time; omit them to use DSH defaults.
-Use dsh_turns to see how long each turn of a session took.`
+Use dsh_turns to see how long each turn of a session took.
+Use dsh_schedules to see the automation tasks (saved prompts DSH delivers on a schedule) and
+dsh_schedule_create / dsh_schedule_update / dsh_schedule_delete to manage them. A created task is
+bound to exactly one session: by default the bridge creates a dedicated session for it; pass sessionId
+to bind it to an existing session instead. Tasks keep firing unattended until deleted, so treat create,
+update and delete as persistent changes to the user's machine.`
+
+/** Timing selectors shared by the schedule tools; DSH accepts exactly one per request. */
+const TIMING_PROPERTIES = {
+  after_seconds: {
+    type: 'number',
+    description: 'Fire once this many seconds after creation (create only).',
+  },
+  at: {
+    description:
+      'Fire once at an absolute instant: an ISO-8601 string with an offset (for example 2026-12-01T09:00:00+08:00), or {date, time, time_zone} for a local wall time.',
+    oneOf: [
+      { type: 'string' },
+      {
+        type: 'object',
+        properties: { date: { type: 'string' }, time: { type: 'string' }, time_zone: { type: 'string' } },
+        required: ['date', 'time', 'time_zone'],
+        additionalProperties: false,
+      },
+    ],
+  },
+  every_seconds: { type: 'number', description: 'Repeat every N seconds (minimum 60).' },
+  daily: {
+    type: 'object',
+    properties: {
+      time: { type: 'string', description: 'Local wall time, HH:MM or HH:MM:SS.' },
+      time_zone: { type: 'string', description: 'IANA zone, for example Asia/Shanghai.' },
+    },
+    required: ['time', 'time_zone'],
+    additionalProperties: false,
+  },
+  weekly: {
+    type: 'object',
+    properties: {
+      time: { type: 'string', description: 'Local wall time, HH:MM or HH:MM:SS.' },
+      time_zone: { type: 'string', description: 'IANA zone, for example Asia/Shanghai.' },
+      weekdays: {
+        type: 'array',
+        items: { type: 'integer', minimum: 1, maximum: 7 },
+        description: 'ISO weekdays: Monday 1 … Sunday 7.',
+      },
+    },
+    required: ['time', 'time_zone', 'weekdays'],
+    additionalProperties: false,
+  },
+  cron: {
+    type: 'object',
+    properties: {
+      expression: { type: 'string', description: 'Five-field cron expression.' },
+      time_zone: { type: 'string', description: 'IANA zone the expression is read in.' },
+    },
+    required: ['expression', 'time_zone'],
+    additionalProperties: false,
+  },
+}
+
+/** Selector properties for one tool; `after_seconds` is create-only in DSH. */
+function timingProperties({ allowAfter = true } = {}) {
+  const entries = Object.entries(TIMING_PROPERTIES).filter(([key]) => allowAfter || key !== 'after_seconds')
+  return Object.fromEntries(entries)
+}
+
+const SCHEDULE_TARGET_PROPERTIES = {
+  sessionId: {
+    type: 'string',
+    description:
+      'Bind the task to this existing DSH session (from dsh_sessions) instead of creating a dedicated one. The prompt is delivered into that session, so its history and its workspace are shared with the task.',
+  },
+  workspaceId: {
+    type: 'string',
+    description: 'With no sessionId: create the task session in this DSH workspace (from dsh_workspaces).',
+  },
+  workspacePath: {
+    type: 'string',
+    description: 'With no sessionId: absolute folder of a registered workspace for the task session.',
+  },
+  workspaceTitle: {
+    type: 'string',
+    description: 'With no sessionId: workspace title for the task session; it has to match exactly one workspace.',
+  },
+  createWorkspace: {
+    type: 'boolean',
+    description: 'With workspacePath and no sessionId: register that folder as a workspace when none exists.',
+  },
+  cwd: {
+    type: 'string',
+    description: 'With no sessionId: absolute working directory for the task session (defaults to the DSH default directory).',
+  },
+  agentPreset: {
+    type: 'string',
+    description: 'With no sessionId: optional DSH agent preset for the task session.',
+  },
+}
 
 const TOOLS = [
   {
@@ -230,6 +327,94 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'dsh_schedules',
+    description:
+      'List DSH automation tasks: saved prompts that DSH delivers into a session at a scheduled time, unattended. Without sessionId it returns every task on the machine from the host catalog, including tasks that already ran (status "inactive"); with sessionId it returns that session\'s active tasks. Use it to find the id before editing or deleting, and to see what is already scheduled.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'Optional: only this session\'s tasks.' },
+        includeInactive: {
+          type: 'boolean',
+          description: 'With sessionId: also include tasks that already ran or ended. Defaults to false.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'dsh_schedule_create',
+    description:
+      'Create a DSH automation task: a saved prompt that DSH delivers into a session at the scheduled time, with nobody watching. By default the bridge creates a dedicated session for it (titled "⏰ <title>") and binds the task there — pass sessionId to bind it to an existing session instead. Exactly one timing selector is required and title is required (max 120 characters). The task persists on the machine until dsh_schedule_delete; recurring tasks keep firing, and a run that needs an approval can stall until the user acts in DSH.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Task title, max 120 characters (required).' },
+        prompt: {
+          type: 'string',
+          description: 'The instruction DSH delivers when the task fires (required). Write it self-contained.',
+        },
+        ...TIMING_PROPERTIES,
+        ...SCHEDULE_TARGET_PROPERTIES,
+        ...{
+          provider: { type: 'string', description: 'With no sessionId: optional model provider for the task session.' },
+          model: { type: 'string', description: 'With no sessionId: optional model for the task session.' },
+          reasoningEffort: { type: 'string', description: 'With no sessionId: optional reasoning effort for that model.' },
+        },
+      },
+      required: ['title', 'prompt'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'dsh_schedule_update',
+    description:
+      'Edit one DSH automation task: rename it, replace its instruction, change when it runs, or any combination. Only active tasks can be edited, and after_seconds is create-only — reschedule with at / every_seconds / daily / weekly / cron. Identify the task by id from dsh_schedules; sessionId is optional and only narrows the lookup.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task id from dsh_schedules (required).' },
+        sessionId: { type: 'string', description: 'Optional: the session the task is bound to.' },
+        title: { type: 'string', description: 'New title (max 120 characters). Omit to keep the current one.' },
+        prompt: { type: 'string', description: 'New instruction. Omit to keep the current one.' },
+        ...timingProperties({ allowAfter: false }),
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'dsh_schedule_delete',
+    description:
+      'Delete one DSH automation task permanently; its saved delivery history goes with it and it stops firing. The session it was bound to is left untouched. Get the id from dsh_schedules.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task id from dsh_schedules (required).' },
+        sessionId: { type: 'string', description: 'Optional: the session the task is bound to.' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'dsh_schedule_history',
+    description:
+      'List the saved deliveries of one DSH automation task, newest first: when each run was scheduled and when the reminder reached the session inbox. A receipt proves delivery into the inbox, not that the model ran or finished. Get the id from dsh_schedules.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task id from dsh_schedules (required).' },
+        sessionId: { type: 'string', description: 'Optional: the session the task is bound to.' },
+        limit: { type: 'integer', description: 'How many deliveries to return, 1-100 (default 20).' },
+        before: { type: 'string', description: 'Optional message id cursor: return deliveries older than it.' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 const HANDLERS = {
@@ -322,6 +507,51 @@ const HANDLERS = {
     }
     // 冷会话要把持久化日志读一遍，给更宽的预算。
     return formatTurns(await call('/turns', { method: 'GET', query, timeoutMs: 60_000 }))
+  },
+
+  async dsh_schedules(args) {
+    const query = {
+      ...(args.sessionId === undefined ? {} : { sessionId: args.sessionId }),
+      ...(args.includeInactive === true ? { includeInactive: 'true' } : {}),
+    }
+    return formatScheduleList(await call('/schedules', { method: 'GET', query, timeoutMs: 30_000 }))
+  },
+
+  async dsh_schedule_create(args) {
+    const value = await call('/schedule', { method: 'POST', body: scheduleCreateBody(args), timeoutMs: 60_000 })
+    return [
+      `Automation task created in DSH session ${value.sessionId}${
+        value.sessionCreated ? ' (a dedicated session was created for it)' : ' (bound to that existing session)'
+      }.`,
+      '',
+      formatSchedule(value.schedule),
+      '',
+      'It now fires unattended until deleted; use dsh_schedule_delete to remove it.',
+    ].join('\n')
+  },
+
+  async dsh_schedule_update(args) {
+    const value = await call('/schedule/update', { method: 'POST', body: scheduleUpdateBody(args), timeoutMs: 30_000 })
+    return ['Automation task updated.', '', formatSchedule(value.schedule)].join('\n')
+  },
+
+  async dsh_schedule_delete(args) {
+    const value = await call('/schedule/delete', {
+      method: 'POST',
+      body: { id: args.id, ...(args.sessionId === undefined ? {} : { sessionId: args.sessionId }) },
+      timeoutMs: 30_000,
+    })
+    return `Automation task ${value.id} deleted (it was bound to session ${value.sessionId}). The session itself is untouched.`
+  },
+
+  async dsh_schedule_history(args) {
+    const query = {
+      id: args.id,
+      ...(args.sessionId === undefined ? {} : { sessionId: args.sessionId }),
+      ...(Number.isFinite(args.limit) ? { limit: Math.round(Number(args.limit)) } : {}),
+      ...(args.before === undefined ? {} : { before: args.before }),
+    }
+    return formatScheduleHistory(await call('/schedules/history', { method: 'GET', query, timeoutMs: 30_000 }))
   },
 }
 
@@ -429,6 +659,84 @@ function modelFields(args) {
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
   }
+}
+
+const SCHEDULE_SELECTOR_KEYS = ['after_seconds', 'at', 'every_seconds', 'daily', 'weekly', 'cron']
+const SCHEDULE_TARGET_KEYS = ['sessionId', 'workspaceId', 'workspacePath', 'workspaceTitle', 'cwd', 'agentPreset']
+
+function scheduleCreateBody(args) {
+  const body = { title: args.title, prompt: args.prompt }
+  for (const key of [...SCHEDULE_SELECTOR_KEYS, ...SCHEDULE_TARGET_KEYS]) {
+    if (args[key] !== undefined) body[key] = args[key]
+  }
+  if (args.createWorkspace !== undefined) body.createWorkspace = args.createWorkspace === true
+  return { ...body, ...modelFields(args) }
+}
+
+function scheduleUpdateBody(args) {
+  const body = { id: args.id }
+  // after_seconds 是 create-only：schema 里已经不给它，这里也不透传。
+  for (const key of ['title', 'prompt', 'sessionId', 'at', 'every_seconds', 'daily', 'weekly', 'cron']) {
+    if (args[key] !== undefined) body[key] = args[key]
+  }
+  return body
+}
+
+/** 把一条任务的重复规则渲染成一句人话（与 DSH 记录字段一一对应）。 */
+function scheduleRule(record) {
+  if (record === undefined || record === null) return ''
+  if (typeof record.everySeconds === 'number') return `every ${formatDuration(record.everySeconds * 1000)}`
+  if (typeof record.afterSeconds === 'number') return `once, ${formatDuration(record.afterSeconds * 1000)} after creation`
+  if (typeof record.expression === 'string') return `cron ${record.expression} (${record.timeZone ?? '?'})`
+  if (Array.isArray(record.weekdays)) return `weekly on ${record.weekdays.join(',')} at ${record.time} (${record.timeZone ?? '?'})`
+  if (typeof record.time === 'string') return `daily at ${record.time} (${record.timeZone ?? '?'})`
+  return record.kind === 'at' ? 'once, at a fixed instant' : ''
+}
+
+function formatSchedule(record) {
+  if (record === undefined || record === null) return '(no task)'
+  const lines = [`task: ${record.id} [${record.status ?? 'active'}]`, `title: ${record.title}`, `kind: ${record.kind}`]
+  const rule = scheduleRule(record)
+  if (rule !== '') lines.push(`rule: ${rule}`)
+  if (record.scheduledAt) {
+    const relative = typeof record.scheduledInMs === 'number' ? ` (in ${formatDuration(record.scheduledInMs)})` : ''
+    lines.push(`next run: ${record.scheduledAt}${relative}`)
+  }
+  if (record.sessionId) lines.push(`session: ${record.sessionId}`)
+  if (record.lastDelivery) lines.push(`last delivery: ${record.lastDelivery.deliveredAt}`)
+  lines.push('', 'prompt:', record.prompt ?? '')
+  return lines.join('\n')
+}
+
+function formatScheduleList(value) {
+  const items = Array.isArray(value?.items) ? value.items : []
+  const scope = value?.scope === 'all' ? 'on this machine' : `in session ${value?.sessionId ?? '?'}`
+  const lines = [`DSH automation tasks ${scope}: ${items.length}`]
+  if (items.length === 0) {
+    lines.push('(none)')
+    return lines.join('\n')
+  }
+  for (const item of items) {
+    lines.push('', `- ${item.id} [${item.status ?? 'active'}] ${item.title}`)
+    lines.push(`  ${scheduleRule(item) || item.kind}; next run ${item.scheduledAt}`)
+    if (item.sessionId) lines.push(`  session ${item.sessionId}`)
+    if (item.lastDelivery) lines.push(`  last delivery ${item.lastDelivery.deliveredAt}`)
+  }
+  return lines.join('\n')
+}
+
+function formatScheduleHistory(value) {
+  const records = Array.isArray(value?.records) ? value.records : []
+  const lines = [`Delivery history for ${value?.id} (session ${value?.sessionId}): ${records.length} record(s), newest first`]
+  if (records.length === 0) lines.push('(no deliveries yet)')
+  for (const record of records) {
+    lines.push(`- scheduled ${record.scheduledAt} -> delivered ${record.deliveredAt}`)
+  }
+  if (value?.earlierRecordsPruned === true || value?.earlierRecordsUnavailable === true) {
+    lines.push('(older records are no longer available)')
+  }
+  lines.push('', 'A receipt means the reminder reached the session inbox; it does not prove the model ran or finished.')
+  return lines.join('\n')
 }
 
 function formatModel(model) {

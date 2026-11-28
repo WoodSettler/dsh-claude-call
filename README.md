@@ -1,13 +1,14 @@
-# ClaudeCallDSH — 让 Claude Code 在 DSH 里唤起会话并派任务
+# ClaudeCallDSH — 让 Claude Code 在 DSH 里唤起会话、派任务、管自动化任务
 
 一个双向自洽的小桥：
 
 - **DSH 侧**：一个 Host 插件（`dsh-claude-call`），在 `127.0.0.1` 上开一个**独立**的回环 HTTP 服务，收到请求后调用
   `ctx.sessionController.create()` 建会话、`prompt()` 投递任务，再从 **会话日志**（唯一真相）里读出 `turn/end`
-  和最后一条 `assistant/message` 作为答复。
-- **Claude Code 侧**：一个**零依赖**的 MCP stdio server（`mcp/server.mjs`），把桥包装成 9 个工具：
+  和最后一条 `assistant/message` 作为答复；自动化任务则走宿主的 `ctx.schedule` 服务。
+- **Claude Code 侧**：一个**零依赖**的 MCP stdio server（`mcp/server.mjs`），把桥包装成 14 个工具：
   `dsh_task` / `dsh_send` / `dsh_wait` / `dsh_status` / `dsh_cancel` /
-  `dsh_sessions` / `dsh_workspaces` / `dsh_models` / `dsh_turns`。
+  `dsh_sessions` / `dsh_workspaces` / `dsh_models` / `dsh_turns` /
+  `dsh_schedules` / `dsh_schedule_create` / `dsh_schedule_update` / `dsh_schedule_delete` / `dsh_schedule_history`。
 
 ```
 Claude Code ──(MCP stdio)──> mcp/server.mjs ──(loopback HTTP + token)──> dsh-claude-call 插件
@@ -34,7 +35,7 @@ DSH Desktop 的 Web 服务外面有一层 `desktopBrowserAccess` 网关：只有
   {
     "schema": 1,
     "name": "claude-call",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "origin": "http://127.0.0.1:<随机端口>",
     "route": "",
     "token": "<每次启动随机生成的 48 位十六进制>",
@@ -71,6 +72,11 @@ claude mcp remove -s user dsh-call
 | `dsh_workspaces` | 列已注册的 workspace（id、标题、路径、会话数） | — |
 | `dsh_models` | 列可用模型（按 provider 分组）与各自支持的 `reasoningEffort`，并给出部署默认 | — |
 | `dsh_turns` | 逐轮列出一个会话的耗时（最新在前）：每轮时长、起止时刻、结束原因、步数、该轮的提示 | `sessionId`（必填）、`limit`（默认 20） |
+| `dsh_schedules` | 列**自动化任务**：不给 `sessionId` 看全机（含已跑完的 `inactive`），给了就看该会话的活动任务 | `sessionId`、`includeInactive` |
+| `dsh_schedule_create` | 建自动化任务：默认**新建一个专用会话**承载投递，给 `sessionId` 则绑到已有会话 | `title`（必填，≤120 字）、`prompt`（必填）、时间选择器五选一、`sessionId`、workspace / cwd / `agentPreset` / 模型字段 |
+| `dsh_schedule_update` | 改名字 / 指令 / 时间（仅活动任务；`after_seconds` 只能创建时用） | `id`（必填）、`sessionId`、`title`、`prompt`、时间选择器（`at` / `every_seconds` / `daily` / `weekly` / `cron`） |
+| `dsh_schedule_delete` | 彻底删除任务（连同已保存的投递记录）；它绑定的会话保留 | `id`（必填）、`sessionId` |
+| `dsh_schedule_history` | 看一条任务的投递记录（最新在前） | `id`（必填）、`sessionId`、`limit`（默认 20）、`before` |
 
 等待超时不会失败，而是返回 `status: "running"` 和 `sinceSeq`，让调用方用 `dsh_wait` 续等——
 这样不会被 Claude Code 的 MCP 工具超时截断。`sinceSeq` 只统计**在该序号之后结束**的轮次，
@@ -107,6 +113,34 @@ claude mcp remove -s user dsh-call
 时间戳一律取自事件自身，所以桥什么时候被叫醒都不影响统计。冷会话（DSH 重启前建的）会先读一遍持久化日志，
 `dsh_turns` 因此给它更宽的 60 秒预算。
 
+### 自动化任务
+
+`dsh_schedule_*` 直接驱动 DSH 宿主的 `ctx.schedule` 服务（就是 DSH「自动化任务」页面管的那批提醒）。
+一条任务**绑定恰好一个会话**，到点由宿主把 prompt 投进那个会话——所以"绑到哪"决定了它在哪个目录、
+用哪个模型和权限跑、以及运行记录落在哪条日志里。
+
+两种绑定方式：
+
+- **默认：新建专用会话**（`mode: "new-session"`）。桥按 `workspaceId` / `workspacePath` / `cwd` 建一个会话，
+  用 `⏰ <标题>` 命名，把任务绑进去，再返回 `sessionId`。这与 DSH 自动化任务页的「新建」流程同形：
+  历史隔离、和你的对话并行、清理你的工作会话时不会牵动任务。
+- **显式绑定已有会话**（`mode: "session"`，传 `sessionId`）。它继承那个会话的 workspace、模型、
+  权限预设与历史上下文，适合"接着这条对话继续"；代价是投递会排进该会话的收件箱（和你自己的输入互相排队），
+  而且**归档带活动任务的会话会被 DSH 拒绝**，选择"停止"会删掉它所有活动提醒（取消归档也带不回来）。
+  注意 DSH 原生工具只能绑"调用它的那个会话"，桥能跨会话绑定是因为它直接调服务。
+
+请求里的时间选择器**恰好给一个**（`after_seconds` / `at` / `every_seconds` / `daily` / `weekly` / `cron`），
+`title` 必填且 ≤120 字。其他需要知道的宿主语义：
+
+- **任务比会话活得久**：`GET /schedules` 走全机 catalog，所以能看到已跑完（`inactive`）或绑定会话已归档的任务。
+- **同一会话到期的周期任务会被合并成一条消息**（一个轮次），不是各跑各的。
+- **回执 ≠ 执行**：投递记录只证明提醒进了会话收件箱，不证明模型跑了、更不证明跑完了（`dsh_status` 看结果）。
+- **不支持暂停 / 立即执行 / 每次运行新建会话**；`after_seconds` 只在创建时有效。
+- 投递时若绑定的会话恢复失败（被删、被移走），DSH 保留任务并记一条 warn，**没有自动重试定时器**：要等下一次
+  任务管理操作、别的计划唤醒或宿主重启才会再试。
+- 需要人工审批的自动化会一直等人点，桥**不会**替它改权限预设。
+- 写操作（建/改/删）可以用配置项 `allowScheduleWrite: false` 整体关掉，读（列表/历史）不受影响。
+
 ### 在 Claude Code 里可以这样说
 
 - 「把 `~/repo-x` 里那个失败的测试修一下，交给 DSH 跑」→ 它会调 `dsh_task`，`cwd` 指向仓库。
@@ -115,6 +149,8 @@ claude mcp remove -s user dsh-call
 - 「上次让 DSH 弄的那个还差多少？接着让它干」→ `dsh_sessions` 找到那个会话（拿到 `sessionId`），再 `dsh_send`。
 - 「这个活放到 worktree-x 那个 workspace 里做，用 glm-5.3 高推理」→ `dsh_workspaces` / `dsh_models` 取 id，
   再 `dsh_task` + `workspaceId` + `model` + `reasoningEffort`。
+- 「每天早上九点让 DSH 汇总昨天的会议纪要」→ `dsh_schedule_create`（`daily`，默认给它建专用会话）。
+- 「现在都设了哪些定时任务？」→ `dsh_schedules`；「把那条改成八点半」→ `dsh_schedule_update`。
 
 ## 配置项
 
@@ -130,6 +166,8 @@ claude mcp remove -s user dsh-call
 | `waitTimeoutSeconds` | `120` | 单次同步 `wait` 默认预算 |
 | `maxWaitSeconds` | `240` | 单次同步 `wait` 硬上限（见「已知限制」第 2 条） |
 | `listLimit` | `20` | `GET /sessions` 默认返回条数（上限 200） |
+| `allowScheduleWrite` | `true` | 是否允许建 / 改 / 删自动化任务；`false` 时写操作返回 403，读不受影响 |
+| `scheduleSessionPrefix` | `⏰ ` | 默认新建的任务会话的标题前缀 |
 | `token` | 随机 | 想固定 token（例如写自己的脚本）时用 |
 
 ## HTTP 接口（给自己的脚本用）
@@ -148,20 +186,27 @@ claude mcp remove -s user dsh-call
 | `POST /wait` | `{sessionId, sinceSeq, timeoutSeconds?}` | `{status: "done" \| "running", text, turnEndReason, turnDurationMs}` |
 | `GET /status?sessionId=` | — | `{...会话记录, running, live, lastAssistantText, lastTurnEndReason, seq, sinceSeq}` |
 | `POST /cancel` | `{sessionId}` | `{cancelled: true}` |
+| `GET /schedules` | 查询串 `?sessionId=&includeInactive=` | `{ok, scope: "all" \| "session", count, items: [{id, kind, title, prompt, scheduledAt, scheduledInMs, sessionId, status, lastDelivery?, …规则字段}]}` |
+| `GET /schedules/history` | 查询串 `?id=&sessionId=&limit=&before=` | `{ok, sessionId, id, records: [{scheduledAt, deliveredAt, messageId, prompt?}], retention, earlierRecordsUnavailable, earlierRecordsPruned}` |
+| `POST /schedule` | `{title, prompt, <一个时间选择器>, sessionId?, workspaceId?/workspacePath?/workspaceTitle?/createWorkspace?/cwd?, agentPreset?, provider?, model?, reasoningEffort?}` | `{ok, mode: "new-session" \| "session", sessionId, sessionCreated, workspace?, schedule}` |
+| `POST /schedule/update` | `{id, sessionId?, title?, prompt?, <一个时间选择器，不能是 after_seconds>}` | `{ok, sessionId, schedule}`；未知 id 404、CAS 冲突 409 |
+| `POST /schedule/delete` | `{id, sessionId?}` | `{ok, sessionId, id, deleted: true}`；未知 id 404 |
 
 ## 测试
 
 ```powershell
-cd E:\Repos\dsh-claude-call
+cd <本仓库目录>
 node test/bridge.test.mjs   # 或 node --test test/
 ```
 
-测试用一个 stub Cordis 上下文直接挂载插件，覆盖：token 认证、建会话 + 等待 + 取答复、`wait:false`、
-`wait`/`status` 一致性、`sinceSeq` 边界、续聊、冷会话（重启后 `send`）与其扫描起点、旧答复不被当成本轮结果、
-`sinceSeq` 缺失被拒、未知会话/路由、卸载时删除发现文件，以及会话发现（workspace / 模型 /
+测试用一个 stub Cordis 上下文直接挂载插件（含 `ctx.schedule` 替身），覆盖：token 认证、建会话 + 等待 + 取答复、
+`wait:false`、`wait`/`status` 一致性、`sinceSeq` 边界、续聊、冷会话（重启后 `send`）与其扫描起点、
+旧答复不被当成本轮结果、`sinceSeq` 缺失被拒、未知会话/路由、卸载时删除发现文件，会话发现（workspace / 模型 /
 可续状态）、单会话精读、workspace 与模型目录、创建时指定 workspace 与模型、`dsh_send` 拒绝 workspace
-字段并换模型、归档与子代理会话的拦截，还有每轮耗时（桥耗时与轮耗时、逐轮列表、未闭合轮次算 pending、
-冷会话从持久化日志读、未知会话 404）。共 23 个测试，**不依赖运行中的 DSH**。
+字段并换模型、归档与子代理会话的拦截，每轮耗时（桥耗时与轮耗时、逐轮列表、未闭合轮次算 pending、
+冷会话从持久化日志读、未知会话 404），以及自动化任务（默认新建专用会话、显式绑定已有会话、标题与时间选择器
+校验、归档会话被拒、CAS 改名、`after_seconds` 只能创建时用、写开关、无 schedule 服务的部署、
+创建失败时回报已建会话）。共 32 个测试，**不依赖运行中的 DSH**。
 
 沙箱提示：DSH 的沙箱不允许 `node --test` 通过管道 spawn 子进程，直接跑 `node --test test/`
 会报 `Error: spawn EPERM`；用上面的**进程内**跑法 `node test/bridge.test.mjs` 即可。
@@ -190,6 +235,9 @@ node test/bridge.test.mjs   # 或 node --test test/
 9. **每轮耗时的口径**：`dsh_turns` 的时长＝`turn/end.time - turn/start.time`。日志里缺 `turn/start`（例如从更早
    的格式迁移来、或续聊时只看到半轮）时该轮 `durationMs` 为 `null`，桥不猜。fork 出来的会话会带父会话的
    继承前缀，那些轮次也会一起列出。
+10. **自动化任务的宿主约束照单全收**：任务绑定唯一会话（默认新建专用会话，给 `sessionId` 才绑已有会话）、
+    归档带活动任务的会话会被 DSH 拒绝、同一会话到期的周期任务合并成一条消息、不支持暂停 / 立即执行 /
+    每次运行新建会话、投递回执不证明模型执行。详见上面「自动化任务」一节。
 
 ## 故障排查
 

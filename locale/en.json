@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Claude Code Bridge",
-    "description": "Lets Claude Code list DSH sessions, workspaces and models, wake a session in a chosen workspace and model, dispatch a task, read the answer back, and inspect how long each turn took over a loopback HTTP bridge."
+    "description": "Lets Claude Code list DSH sessions, workspaces, models and automation tasks, wake a session in a chosen workspace and model, dispatch a task, read the answer back, inspect how long each turn took, and create or edit scheduled tasks over a loopback HTTP bridge."
   }
 }

@@ -22,6 +22,8 @@
  *   waitTimeoutSeconds   default wait budget (default 120)
  *   maxWaitSeconds       hard cap for one synchronous wait (default 240)
  *   listLimit            default page size for GET /sessions (default 20)
+ *   allowScheduleWrite   allow creating/editing/deleting automation tasks (default true)
+ *   scheduleSessionPrefix  title prefix for a task's dedicated session (default "⏰ ")
  *   token                fixed token instead of a random per-process one
  *
  * Read-only discovery (GET /sessions, /workspaces, /models, /turns) answers from DSH
@@ -30,6 +32,13 @@
  * title and the model it is using, which the session header does not carry.
  * GET /turns folds the event log into one row per turn, so a caller can see how
  * long each dispatched turn took (the timestamps are the DSH event times).
+ *
+ * Automation tasks (GET /schedules, /schedules/history, POST /schedule,
+ * /schedule/update, /schedule/delete) drive the host `ctx.schedule` service.
+ * A task is bound to exactly one session and delivers its prompt there; by
+ * default the bridge creates a dedicated session for it (the same shape DSH's
+ * own automation page uses) and only binds to an existing session when the
+ * caller names one.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -38,13 +47,18 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.2.1'
+const VERSION = '0.3.0'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 const DEFAULT_LIST_LIMIT = 20
 const MAX_LIST_LIMIT = 200
+/** Timing selectors DSH accepts on create; exactly one per request. */
+const SCHEDULE_SELECTORS = ['after_seconds', 'at', 'every_seconds', 'daily', 'weekly', 'cron']
+/** `after_seconds` is create-only: DSH has no relative reschedule. */
+const SCHEDULE_UPDATE_SELECTORS = ['at', 'every_seconds', 'daily', 'weekly', 'cron']
+const SCHEDULE_TITLE_LIMIT = 120
 
 export const name = NAME
 /** Every capability this plugin touches; the plugin stays inactive without them. */
@@ -173,6 +187,16 @@ export function apply(ctx, config) {
           return respond(res, 200, await models())
         case 'GET /turns':
           return respond(res, 200, await turns(url.searchParams))
+        case 'GET /schedules':
+          return respond(res, 200, await schedules(url.searchParams))
+        case 'GET /schedules/history':
+          return respond(res, 200, await scheduleHistory(url.searchParams))
+        case 'POST /schedule':
+          return respond(res, 200, await scheduleCreate(await readJson(req)))
+        case 'POST /schedule/update':
+          return respond(res, 200, await scheduleUpdate(await readJson(req)))
+        case 'POST /schedule/delete':
+          return respond(res, 200, await scheduleDelete(await readJson(req)))
         default:
           return respond(res, 404, { ok: false, error: `unknown route: ${key}` })
       }
@@ -506,6 +530,291 @@ export function apply(ctx, config) {
       sinceSeq: lastSeq,
       ...tailOfEvents(inspected?.events),
     }
+  }
+
+  // --------------------------------------------------------- automation tasks
+
+  /**
+   * 自动化任务（宿主 ctx.schedule 服务）。
+   * - 默认新建一个专用会话承载投递，与 DSH 自动化任务页的「新建」流程同形；
+   * - 只有调用方显式给 sessionId 时才绑定到已有会话（DSH 原生工具只能绑调用者自己的会话）；
+   * - 读（列表 / 目录 / 历史）始终可用，写（新建 / 编辑 / 删除）受 allowScheduleWrite 控制。
+   * 注意宿主语义：任务比会话活得久，归档带活动任务的会话会被拒绝；同一会话到期的
+   * 周期任务会被合并成一条消息；回执只证明投递进收件箱，不表示模型执行完成。
+   */
+  async function schedules(params) {
+    const service = scheduleService()
+    const sessionId = optionalText(params.get('sessionId'))
+    const includeInactive = params.get('includeInactive') === 'true'
+    try {
+      // 单会话默认只列活动任务（与 DSH 的 schedule_list 口径一致）；
+      // 要连未运行一起看，走 includeInactive=true 从全机 catalog 里筛。
+      if (sessionId !== undefined && !includeInactive) {
+        const items = await service.list({ sessionId })
+        return {
+          ok: true,
+          origin,
+          scope: 'session',
+          sessionId,
+          count: items.length,
+          items: items.map((record) => scheduleView({ ...record, sessionId, status: 'active' })),
+        }
+      }
+      const entries = await service.catalog()
+      const filtered = sessionId === undefined ? entries ?? [] : (entries ?? []).filter((entry) => String(entry.sessionId) === sessionId)
+      return {
+        ok: true,
+        origin,
+        scope: sessionId === undefined ? 'all' : 'session',
+        ...(sessionId === undefined ? {} : { sessionId }),
+        count: filtered.length,
+        items: filtered.map(scheduleView),
+      }
+    } catch (error) {
+      throw scheduleError(error)
+    }
+  }
+
+  async function scheduleHistory(params) {
+    const service = scheduleService()
+    const id = requireText(params.get('id'), 'id')
+    const hint = optionalText(params.get('sessionId'))
+    // history 需要 (sessionId, id) 二元组；只给 id 时先从 catalog 反查绑定会话。
+    const sessionId = hint ?? (await locateSchedule(id)).sessionId
+    const limit = clampNumber(params.get('limit'), 20, 1, 100)
+    const before = optionalText(params.get('before'))
+    let result
+    try {
+      result = await service.history({ sessionId, id, limit, ...(before === undefined ? {} : { before }) })
+    } catch (error) {
+      throw scheduleError(error)
+    }
+    if (result?.code !== undefined) throw new HttpError(404, `schedule/${result.code}: no delivery history for ${id}`)
+    return { ok: true, origin, sessionId, id, ...result }
+  }
+
+  async function scheduleCreate(body) {
+    assertScheduleWrite()
+    const service = scheduleService()
+    const title = requireTitle(body?.title)
+    const prompt = requireText(body?.prompt, 'prompt')
+    const selector = scheduleSelector(body)
+    const bindTo = optionalText(body?.sessionId)
+    let sessionId = bindTo
+    let sessionCreated = false
+    let workspace
+    if (bindTo === undefined) {
+      // 默认路径：给这条任务建一个专用会话。workspace/cwd/model 都沿用 /task 的口径。
+      const target = await resolveWorkspaceTarget(body)
+      workspace = target.workspace
+      const preset = optionalText(body?.agentPreset) ?? options.agentPreset
+      sessionId = await createSession({
+        cwd: target.cwd,
+        preset,
+        title: `${options.scheduleSessionPrefix}${title}`.slice(0, SCHEDULE_TITLE_LIMIT),
+        workspace: target.workspace,
+      })
+      sessionCreated = true
+      try {
+        await applyModel(sessionId, body)
+      } catch (error) {
+        // 会话已经建出来了：模型选失败也要把它的 id 交出去，别留无声垃圾。
+        throw new HttpError(400, `${describe(error)}（已为它建了专用会话 ${sessionId}，可删除或改作他用）`)
+      }
+    } else {
+      rejectWorkspaceFields(body)
+      const { header } = await describeSession(bindTo)
+      assertResumable(bindTo, header)
+    }
+    let record
+    try {
+      record = await service.create(sessionId, { title, prompt, ...selector })
+    } catch (error) {
+      if (sessionCreated) {
+        // 会话已经建出来了，别把它悄悄留下：错误里带上 id，让调用方能收拾。
+        throw new HttpError(400, `${describeScheduleRefusal(error)}（已为这条任务建了专用会话 ${sessionId}，可在 DSH 里删除或改作他用）`)
+      }
+      throw scheduleError(error)
+    }
+    log(`schedule created ${record?.id} (${record?.kind}) bound to ${sessionId}${sessionCreated ? ' [new session]' : ''}`)
+    return {
+      ok: true,
+      origin,
+      mode: sessionCreated ? 'new-session' : 'session',
+      sessionId,
+      sessionCreated,
+      ...(workspace === undefined ? {} : { workspace: workspaceView(workspace) }),
+      schedule: scheduleView({ ...record, sessionId, status: 'active' }),
+    }
+  }
+
+  async function scheduleUpdate(body) {
+    assertScheduleWrite()
+    const service = scheduleService()
+    const id = requireText(body?.id, 'id')
+    const title = optionalText(body?.title)
+    const prompt = optionalText(body?.prompt)
+    const change = scheduleChange(body)
+    // update 是整条记录的 compare-and-set：expected 必须是"改前那一刻"的记录，
+    // 所以先按 id 把当前记录读出来，绝不接受调用方自带的 expected。
+    const entry = await locateSchedule(id, optionalText(body?.sessionId))
+    let result
+    try {
+      result = await service.update({
+        sessionId: String(entry.sessionId),
+        id,
+        expected: scheduleRecordOf(entry),
+        ...(change === undefined ? {} : { change }),
+        ...(title === undefined ? {} : { title }),
+        ...(prompt === undefined ? {} : { prompt }),
+      })
+    } catch (error) {
+      throw scheduleError(error)
+    }
+    if (result?.updated === true) {
+      log(`schedule updated ${id} in ${entry.sessionId}`)
+      return {
+        ok: true,
+        origin,
+        sessionId: String(entry.sessionId),
+        schedule: scheduleView({ ...result.record, sessionId: String(entry.sessionId), status: 'active' }),
+      }
+    }
+    if (result?.updated === false) {
+      // DSH 对"什么都没改"的 no-op 也回 updated:false，但会带上记录且不给错误码；
+      // 那是有结果的成功，不是冲突。
+      if (result.code === undefined && result.record !== undefined) {
+        return {
+          ok: true,
+          origin,
+          sessionId: String(entry.sessionId),
+          unchanged: true,
+          schedule: scheduleView({ ...result.record, sessionId: String(entry.sessionId), status: 'active' }),
+        }
+      }
+      const code = result.code ?? 'schedule_conflict'
+      throw new HttpError(code === 'schedule_not_found' ? 404 : 409, `schedule/${code}: ${id} was not updated`)
+    }
+    throw scheduleError(result ?? new Error('the schedule service returned no result'))
+  }
+
+  async function scheduleDelete(body) {
+    assertScheduleWrite()
+    const service = scheduleService()
+    const id = requireText(body?.id, 'id')
+    const entry = await locateSchedule(id, optionalText(body?.sessionId))
+    let result
+    try {
+      result = await service.delete({ sessionId: String(entry.sessionId), id })
+    } catch (error) {
+      throw scheduleError(error)
+    }
+    if (result?.deleted !== true) {
+      throw new HttpError(404, `schedule/${result?.code ?? 'schedule_not_found'}: ${id} was not deleted`)
+    }
+    log(`schedule deleted ${id} from ${entry.sessionId}`)
+    return { ok: true, origin, sessionId: String(entry.sessionId), id, deleted: true }
+  }
+
+  function scheduleService() {
+    const service = ctx.get('schedule')
+    if (service === undefined) throw new HttpError(503, 'this DSH deployment has no schedule service')
+    return service
+  }
+
+  function assertScheduleWrite() {
+    if (!options.allowScheduleWrite) {
+      throw new HttpError(403, 'schedule writes are disabled here: set allowScheduleWrite: true in the claude-call plugin config')
+    }
+  }
+
+  /**
+   * 一条任务只带 id 时反查它的绑定会话：catalog 是全机视图（含未运行任务），
+   * 正好用来定位；list 只能按会话查，做不到这一步。
+   */
+  async function locateSchedule(id, sessionIdHint) {
+    const service = scheduleService()
+    let entries
+    try {
+      entries = await service.catalog()
+    } catch (error) {
+      throw scheduleError(error)
+    }
+    const entry = (entries ?? []).find(
+      (candidate) => String(candidate.id) === id && (sessionIdHint === undefined || String(candidate.sessionId) === sessionIdHint),
+    )
+    if (entry === undefined) {
+      throw new HttpError(
+        404,
+        `schedule/schedule_not_found: no task ${id}${sessionIdHint === undefined ? '' : ` in session ${sessionIdHint}`}`,
+      )
+    }
+    return entry
+  }
+
+  /** catalog 条目 = 记录 + 宿主附加字段；update 的 expected 只接受纯记录。 */
+  function scheduleRecordOf(entry) {
+    const { sessionId: _sessionId, status: _status, lastDelivery: _lastDelivery, deliveryHistory: _history, ...record } = entry
+    return record
+  }
+
+  function scheduleView(entry) {
+    if (entry === undefined || entry === null) return null
+    const view = scheduleRecordOf(entry)
+    if (entry.sessionId !== undefined) view.sessionId = String(entry.sessionId)
+    if (entry.status !== undefined) view.status = entry.status
+    if (entry.lastDelivery !== undefined) view.lastDelivery = entry.lastDelivery
+    const at = Date.parse(view.scheduledAt ?? '')
+    if (Number.isFinite(at)) view.scheduledInMs = Math.max(0, at - Date.now())
+    return view
+  }
+
+  function scheduleSelector(body) {
+    const present = SCHEDULE_SELECTORS.filter((key) => body?.[key] !== undefined && body?.[key] !== null)
+    if (present.length === 0) {
+      throw new HttpError(400, `a schedule needs exactly one timing selector: ${SCHEDULE_SELECTORS.join(', ')}`)
+    }
+    if (present.length > 1) {
+      throw new HttpError(400, `a schedule takes exactly one timing selector, got ${present.join(' + ')}`)
+    }
+    return { [present[0]]: body[present[0]] }
+  }
+
+  /** 把 create 用的同一套选择器名翻译成宿主 update 的 ScheduleTimingChange。 */
+  function scheduleChange(body) {
+    if (body?.after_seconds !== undefined) {
+      throw new HttpError(400, 'after_seconds is create-only; reschedule with at / every_seconds / daily / weekly / cron')
+    }
+    const present = SCHEDULE_UPDATE_SELECTORS.filter((key) => body?.[key] !== undefined && body?.[key] !== null)
+    if (present.length === 0) return undefined
+    if (present.length > 1) {
+      throw new HttpError(400, `a reschedule takes exactly one timing selector, got ${present.join(' + ')}`)
+    }
+    const key = present[0]
+    if (key === 'every_seconds') return { kind: 'every', every_seconds: body.every_seconds }
+    return { kind: key, [key]: body[key] }
+  }
+
+  function requireTitle(value) {
+    const title = optionalText(value)
+    if (title === undefined) throw new HttpError(400, 'title must be a non-empty string')
+    if (title.length > SCHEDULE_TITLE_LIMIT) {
+      throw new HttpError(400, `title must be at most ${SCHEDULE_TITLE_LIMIT} characters (DSH limit)`)
+    }
+    return title
+  }
+
+  function describeScheduleRefusal(error) {
+    const code = typeof error?.code === 'string' ? `schedule/${error.code}: ` : ''
+    return `${code}${error instanceof Error ? error.message : String(error)}`
+  }
+
+  /** 服务用错误码（invalid_prompt / not_future / frequency_too_high / …）原样带给调用方。 */
+  function scheduleError(error) {
+    if (error instanceof HttpError) return error
+    const message = error instanceof Error ? error.message : String(error)
+    const code = typeof error?.code === 'string' ? error.code : undefined
+    return new HttpError(400, code === undefined ? `DSH refused the schedule operation: ${message}` : `schedule/${code}: ${message}`)
   }
 
   // ------------------------------------------------------------ session work
@@ -941,6 +1250,13 @@ function normalizeOptions(config) {
     waitTimeoutSeconds: clampNumber(source.waitTimeoutSeconds, 120, 1, 3600),
     maxWaitSeconds: clampNumber(source.maxWaitSeconds, 240, 1, 3600),
     listLimit: clampNumber(source.listLimit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT),
+    // 自动化任务默认允许写（新建/编辑/删除），要收紧就显式 allowScheduleWrite: false。
+    allowScheduleWrite: source.allowScheduleWrite !== false,
+    // 保留用户写的空格：这里不能走 optionalText（它会 trim）。
+    scheduleSessionPrefix:
+      typeof source.scheduleSessionPrefix === 'string' && source.scheduleSessionPrefix.trim() !== ''
+        ? source.scheduleSessionPrefix
+        : '⏰ ',
     token: optionalText(source.token) ?? '',
   }
 }
