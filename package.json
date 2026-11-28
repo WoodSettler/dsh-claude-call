@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-call",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Local bridge that lets Claude Code list DSH sessions, wake one in a chosen workspace and model, dispatch a task, read the answer back, inspect turn timings, and manage scheduled automation tasks.",
   "type": "module",

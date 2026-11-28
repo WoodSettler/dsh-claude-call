@@ -94,16 +94,25 @@ function createHarness(overrides = {}) {
     },
     async list() {
       if (overrides.list) return overrides.list()
-      return [...store.values()].map((session) => ({
-        sessionId: session.id,
-        cwd: session.header.cwd,
-        running: false,
-        agentAvailable: true,
-        blank: false,
-        updatedAt: Date.now(),
-      }))
+      // 真实 sessionController.list() 回的是 {items}（不是裸数组），替身必须同形，
+      // 否则"桥按数组处理"这类契约漂移会被测试放过。
+      return {
+        items: [...store.values()].map((session) => ({
+          sessionId: session.id,
+          cwd: session.header.cwd,
+          running: false,
+          agentAvailable: true,
+          blank: false,
+          updatedAt: Date.now(),
+        })),
+      }
     },
-    async projections(request) {
+    async projections(request, signal) {
+      // 真实实现在这里无条件 signal.throwIfAborted()：桥漏传信号就抛 TypeError，
+      // 被 readProjections 吞掉后表现为 title/model 永远为 null。替身照抄这个门槛。
+      if (signal === undefined) {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+      }
       return overrides.projections === undefined ? null : overrides.projections(request.sessionId)
     },
     async selectModel(request) {
@@ -335,7 +344,7 @@ test('sessions list reports workspace, model and resume state', async (t) => {
     },
     { sessionId: 'session-old', cwd: 'C:\\elsewhere', origin: 'subagent', updatedAt: Date.parse('2026-01-01T00:00:00Z') },
   ]
-  const { call } = await mount(t, { workspaces, list: async () => rows })
+  const { call } = await mount(t, { workspaces, list: async () => ({ items: rows }) })
 
   const listed = await call('/sessions')
   assert.equal(listed.status, 200, JSON.stringify(listed.body))

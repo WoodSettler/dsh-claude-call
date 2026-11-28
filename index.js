@@ -47,7 +47,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
@@ -312,21 +312,34 @@ export function apply(ctx, config) {
    */
   async function sessions(params) {
     const sessionId = optionalText(params.get('sessionId'))
+    // 单会话精读：projections() 拿不到值（例如从没落过投影缓存的会话）时，
+    // 用列表行自带的投影提示兜底，至少不让 title/model 无故消失。
+    const summaries = sessionRows(await listSessions())
     if (sessionId !== undefined) {
       const header = await knownHeader(sessionId)
-      return { ok: true, origin, items: [await sessionRow(sessionId, header)] }
+      const row = summaries.find((candidate) => String(candidate?.sessionId) === String(sessionId))
+      const hints = (await readProjections(sessionId)) ?? row?.projections
+      return {
+        ok: true,
+        origin,
+        items: [
+          sessionRecord({
+            sessionId,
+            hints,
+            row,
+            header,
+            live: ctx.sessions.get(sessionId),
+            agent: ctx.agents.get(sessionId),
+            archived: archivedIds(),
+          }),
+        ],
+      }
     }
     const limit = clampNumber(params.get('limit'), options.listLimit, 1, MAX_LIST_LIMIT)
     const filter = optionalText(params.get('workspace'))
     const archived = archivedIds()
-    let rows
-    try {
-      rows = await ctx.sessionController.list({})
-    } catch (error) {
-      throw new HttpError(500, `DSH could not list sessions: ${describe(error)}`)
-    }
     const items = []
-    for (const row of rows ?? []) {
+    for (const row of summaries) {
       if (row?.sessionId === undefined) continue
       const record = sessionRecord({ sessionId: row.sessionId, hints: row.projections, row, archived })
       // workspace 过滤同时接受 id、标题与 cwd，调用方按哪种口径收敛都能命中。
@@ -342,6 +355,14 @@ export function apply(ctx, config) {
     }
     items.sort((left, right) => String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? '')))
     return { ok: true, origin, count: items.length, limit, items: items.slice(0, limit) }
+  }
+
+  async function listSessions() {
+    try {
+      return await ctx.sessionController.list({}, liveSignal())
+    } catch (error) {
+      throw new HttpError(500, `DSH could not list sessions: ${describe(error)}`)
+    }
   }
 
   /** GET /workspaces：列出已注册的 workspace（durable 顺序，与 DSH 界面一致）。 */
@@ -1135,11 +1156,26 @@ export function apply(ctx, config) {
   /** 单会话精读；投影只是加分项，读不到就少带 title/model 而不影响会话本身。 */
   async function readProjections(sessionId) {
     try {
-      return await ctx.sessionController.projections({ sessionId })
+      return await ctx.sessionController.projections({ sessionId }, liveSignal())
     } catch (error) {
       log(`projections for ${sessionId} unavailable: ${describe(error)}`)
       return undefined
     }
+  }
+
+  /** DSH 的 list() 回的是 {items}，不是数组；两种形状都接住，避免契约漂移时整端点 500。 */
+  function sessionRows(value) {
+    if (Array.isArray(value)) return value
+    return Array.isArray(value?.items) ? value.items : []
+  }
+
+  /**
+   * projections() 内部**无条件**调用 signal.throwIfAborted()：不传信号会直接
+   * TypeError，被 readProjections 吞掉后表现为 title/model 永远是 null。
+   * 这里给一个永不中止的信号（桥没有需要中途取消这些只读调用的路径）。
+   */
+  function liveSignal() {
+    return new AbortController().signal
   }
 
   /**
