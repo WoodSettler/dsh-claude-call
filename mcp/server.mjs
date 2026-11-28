@@ -801,11 +801,19 @@ function formatWorkspaces(value) {
 function formatDuration(ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) return 'unknown'
   const value = Math.max(0, Math.round(ms))
-  if (value < 1000) return `${value}ms`
-  if (value < 60_000) return `${(value / 1000).toFixed(1)}s`
-  const minutes = Math.floor(value / 60_000)
-  const seconds = Math.round((value % 60_000) / 1000)
-  return `${minutes}m${String(seconds).padStart(2, '0')}s`
+  const totalSeconds = Math.round(value / 1000)
+  // 一分钟以内保留一位小数，够看清一轮模型耗时；超过就按 天/时/分/秒 拼。
+  if (totalSeconds < 60) return `${(value / 1000).toFixed(1)}s`
+  const days = Math.floor(totalSeconds / 86_400)
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600)
+  const minutes = Math.floor((totalSeconds % 3_600) / 60)
+  const seconds = totalSeconds % 60
+  const parts = []
+  if (days > 0) parts.push(`${days}d`)
+  if (hours > 0) parts.push(`${hours}h`)
+  if (minutes > 0) parts.push(`${minutes}m`)
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds}s`)
+  return parts.join('')
 }
 
 function clockOf(ms) {
