@@ -320,6 +320,16 @@ test('disposal removes the endpoint file', async (t) => {
   assert.equal(existsSync(endpointFile), false)
 })
 
+test('session list marks attached sessions as live', async (t) => {
+  const { call } = await mount(t)
+  const created = await call('/task', { method: 'POST', body: { prompt: '活着', wait: false } })
+  const list = await call('/sessions')
+  assert.equal(list.status, 200, JSON.stringify(list.body))
+  const row = (list.body.items ?? []).find((item) => item.sessionId === created.body.sessionId)
+  assert.ok(row, 'the new session appears in the list')
+  assert.equal(row.live, true)
+})
+
 test('sessions list reports workspace, model and resume state', async (t) => {
   const workspaces = [{ id: 'ws-1', title: 'dsh-claude-call', path: 'C:\\work\\demo', sessionIds: ['session-new'] }]
   const rows = [

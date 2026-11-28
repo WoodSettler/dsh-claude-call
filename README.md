@@ -35,7 +35,7 @@ DSH Desktop 的 Web 服务外面有一层 `desktopBrowserAccess` 网关：只有
   {
     "schema": 1,
     "name": "claude-call",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "origin": "http://127.0.0.1:<随机端口>",
     "route": "",
     "token": "<每次启动随机生成的 48 位十六进制>",

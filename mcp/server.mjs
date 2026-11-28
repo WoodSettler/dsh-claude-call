@@ -17,7 +17,7 @@ import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const VERSION = '0.3.1'
+const VERSION = '0.3.2'
 const ENDPOINT_FILE =
   process.env.DSH_CLAUDE_CALL_ENDPOINT ??
   join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'claude-call', 'endpoint.json')

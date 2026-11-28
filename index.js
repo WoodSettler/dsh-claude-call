@@ -47,7 +47,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
 const NAME = 'claude-call'
-const VERSION = '0.3.1'
+const VERSION = '0.3.2'
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const DEFAULT_ENDPOINT = join(DSH_HOME, 'claude-call', 'endpoint.json')
 const BODY_LIMIT = 1024 * 1024
@@ -341,7 +341,15 @@ export function apply(ctx, config) {
     const items = []
     for (const row of summaries) {
       if (row?.sessionId === undefined) continue
-      const record = sessionRecord({ sessionId: row.sessionId, hints: row.projections, row, archived })
+      const record = sessionRecord({
+        sessionId: row.sessionId,
+        hints: row.projections,
+        row,
+        // 列表行不告诉你会话是否还挂在宿主里；两个 map 查一下就能给出准确的 live/running。
+        live: ctx.sessions.get(row.sessionId),
+        agent: ctx.agents.get(row.sessionId),
+        archived,
+      })
       // workspace 过滤同时接受 id、标题与 cwd，调用方按哪种口径收敛都能命中。
       if (
         filter !== undefined &&
